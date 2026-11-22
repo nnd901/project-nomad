@@ -27,6 +27,7 @@ import {
   locateZippedEntry,
   manualArchivePath,
   manualFormats,
+  matchZipEntry,
   parseVaultIndex,
   resolveInside,
   vaultFacets,
@@ -67,6 +68,9 @@ export interface FieldManualOpenResult {
   contentType: string
   disposition: string
 }
+
+const DOWNLOAD_STOP_WAIT_MS = 20_000
+const DOWNLOAD_FORCE_STOP_AFTER_MS = 5_000
 
 const CONTENT_TYPES: Record<FieldManualFormat, string> = {
   pdf: 'application/pdf',
@@ -161,7 +165,18 @@ export class FieldManualVaultService {
 
   async remove(editionId: FieldManualEditionId): Promise<FieldManualActionResult> {
     await this.cancel(editionId)
-    await waitUntilIdle(editionId)
+    const stopped = await waitUntilIdle(editionId)
+    if (!stopped || (await editionIsBusy(editionId))) {
+      logger.warn(
+        `[FieldManualVault] refused to remove ${editionId} because the download is still running`
+      )
+      return {
+        success: false,
+        status: 409,
+        message:
+          'The download is still shutting down, so its files were left in place. Try again once it has stopped.',
+      }
+    }
 
     const storage = fieldManualStorageRoot()
     const staging = fieldManualStagingDir(editionId)
@@ -271,6 +286,13 @@ export class FieldManualVaultService {
     const opened = await openZipEntry(zipPath, located.entryName)
     if (!opened) {
       return { success: false, status: 404, message: 'That file is not inside the downloaded archive.' }
+    }
+    if ('ambiguous' in opened) {
+      return {
+        success: false,
+        status: 409,
+        message: 'More than one file in the archive has that name, so it was not opened.',
+      }
     }
 
     return {
@@ -426,35 +448,92 @@ async function bytesUnder(dir: string): Promise<number> {
   return walk(dir)
 }
 
-async function killPid(editionId: FieldManualEditionId): Promise<void> {
+async function readRecordedPid(editionId: FieldManualEditionId): Promise<number | null> {
   let text: string
   try {
     text = await readFile(fieldManualPidPath(editionId), 'utf8')
   } catch {
-    return
+    return null
   }
   const pid = Number(text.trim())
-  if (!Number.isInteger(pid) || pid <= 0) return
+  if (!Number.isInteger(pid) || pid <= 0) return null
+  return pid
+}
+
+function processIsAlive(pid: number): boolean {
   try {
-    process.kill(pid, 'SIGTERM')
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+async function recordedProcessAlive(editionId: FieldManualEditionId): Promise<boolean> {
+  const pid = await readRecordedPid(editionId)
+  return pid !== null && processIsAlive(pid)
+}
+
+async function killPid(
+  editionId: FieldManualEditionId,
+  signal: NodeJS.Signals = 'SIGTERM'
+): Promise<void> {
+  const pid = await readRecordedPid(editionId)
+  if (pid === null) return
+  try {
+    process.kill(pid, signal)
   } catch {
     // The process already exited.
   }
 }
 
-async function waitUntilIdle(editionId: FieldManualEditionId): Promise<void> {
+function jobStateIsBusy(state: string): boolean {
+  return state === 'active' || state === 'waiting' || state === 'delayed'
+}
+
+async function editionIsBusy(editionId: FieldManualEditionId): Promise<boolean> {
+  if (await recordedProcessAlive(editionId)) return true
   const queue = QueueService.getInstance().getQueue(DownloadFieldManualJob.queue)
-  const started = Date.now()
-  while (Date.now() - started < 20_000) {
-    const job = await queue.getJob(DownloadFieldManualJob.jobIdFor(editionId))
-    if (!job) return
-    const state = await job.getState()
-    if (state !== 'active' && state !== 'waiting' && state !== 'delayed') {
-      await job.remove().catch(() => undefined)
-      return
+  const job = await queue.getJob(DownloadFieldManualJob.jobIdFor(editionId))
+  if (!job) return false
+  return jobStateIsBusy(await job.getState())
+}
+
+async function discardSettledJob(editionId: FieldManualEditionId): Promise<void> {
+  const queue = QueueService.getInstance().getQueue(DownloadFieldManualJob.queue)
+  const job = await queue.getJob(DownloadFieldManualJob.jobIdFor(editionId))
+  if (!job) return
+  if (jobStateIsBusy(await job.getState())) return
+  await job.remove().catch(() => undefined)
+}
+
+/**
+ * Wait until aria2 and the queue job have both stopped.
+ * Returns false when they are still running so the caller does not delete
+ * files out from under them.
+ */
+async function waitUntilIdle(editionId: FieldManualEditionId): Promise<boolean> {
+  const deadline = Date.now() + DOWNLOAD_STOP_WAIT_MS
+  const forceStopAt = Date.now() + DOWNLOAD_FORCE_STOP_AFTER_MS
+  let forcedStop = false
+  while (Date.now() <= deadline) {
+    if (!(await editionIsBusy(editionId))) {
+      await discardSettledJob(editionId)
+      return true
     }
-    await new Promise((resolve) => setTimeout(resolve, 500))
+    // cancel() already sent SIGTERM. A stuck aria2 must die before this wait
+    // gives up, otherwise remove() would delete files it is still writing.
+    if (!forcedStop && Date.now() >= forceStopAt && (await recordedProcessAlive(editionId))) {
+      forcedStop = true
+      await killPid(editionId, 'SIGKILL')
+    }
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) break
+    await new Promise((resolve) => setTimeout(resolve, Math.min(500, remaining)))
   }
+  if (await editionIsBusy(editionId)) return false
+  await discardSettledJob(editionId)
+  return true
 }
 
 function ignoreMissing(error: NodeJS.ErrnoException): void {
@@ -485,7 +564,67 @@ function formatLabel(format: FieldManualFormat): string {
   }
 }
 
-function openZipEntry(
+type OpenedZipEntry = { stream: Readable; size: number } | { ambiguous: true } | null
+
+function openZipEntry(zipPath: string, entryName: string): Promise<OpenedZipEntry> {
+  return new Promise((resolve, reject) => {
+    openZip(zipPath, { lazyEntries: true, autoClose: false }, (error, zip) => {
+      if (error || !zip) {
+        reject(error ?? new Error('Could not open the archive'))
+        return
+      }
+      listZipEntryNames(zip).then(
+        (names) => {
+          zip.close()
+          const match = matchZipEntry(names, entryName)
+          switch (match.kind) {
+            case 'match':
+              openExactZipEntry(zipPath, match.name).then(resolve, reject)
+              return
+            case 'missing':
+              resolve(null)
+              return
+            case 'ambiguous':
+              resolve({ ambiguous: true })
+              return
+            default: {
+              const unreachable: never = match
+              reject(new Error(`Unhandled zip match ${JSON.stringify(unreachable)}`))
+            }
+          }
+        },
+        (listError: unknown) => {
+          zip.close()
+          reject(listError instanceof Error ? listError : new Error(String(listError)))
+        }
+      )
+    })
+  })
+}
+
+function listZipEntryNames(zip: ZipFile): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    const names: string[] = []
+    let settled = false
+    zip.on('error', (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    })
+    zip.on('entry', (entry: Entry) => {
+      names.push(entry.fileName)
+      zip.readEntry()
+    })
+    zip.on('end', () => {
+      if (settled) return
+      settled = true
+      resolve(names)
+    })
+    zip.readEntry()
+  })
+}
+
+function openExactZipEntry(
   zipPath: string,
   entryName: string
 ): Promise<{ stream: Readable; size: number } | null> {
@@ -495,15 +634,21 @@ function openZipEntry(
         reject(error ?? new Error('Could not open the archive'))
         return
       }
-      readZipEntry(zip, entryName).then(resolve, (entryError: unknown) => {
-        zip.close()
-        reject(entryError instanceof Error ? entryError : new Error(String(entryError)))
-      })
+      readExactZipEntry(zip, entryName).then(
+        (opened) => {
+          if (!opened) zip.close()
+          resolve(opened)
+        },
+        (entryError: unknown) => {
+          zip.close()
+          reject(entryError instanceof Error ? entryError : new Error(String(entryError)))
+        }
+      )
     })
   })
 }
 
-function readZipEntry(
+function readExactZipEntry(
   zip: ZipFile,
   entryName: string
 ): Promise<{ stream: Readable; size: number } | null> {
@@ -526,7 +671,7 @@ function readZipEntry(
     })
     zip.on('entry', (entry: Entry) => {
       const name = entry.fileName.replace(/\\/g, '/')
-      if (name !== target && !name.endsWith(`/${target}`)) {
+      if (name !== target) {
         zip.readEntry()
         return
       }

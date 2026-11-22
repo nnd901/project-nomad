@@ -1,4 +1,5 @@
-import { resolve, sep } from 'node:path'
+import { readdir, rm, unlink } from 'node:fs/promises'
+import { join, relative, resolve, sep } from 'node:path'
 import { decodeBencode, type BencodeValue } from './bencode.js'
 import type { FieldManualFormat } from '../../types/field_manual_vault.js'
 
@@ -63,6 +64,21 @@ const INDEX_COLUMNS = [
 /** Piece-alignment padding and parity volumes. The manuals themselves are the zip files. */
 export function isVaultSideFile(filePath: string): boolean {
   return filePath.split('/').includes('.pad') || filePath.endsWith('.par2')
+}
+
+/** aria2 control files plus torrent padding and parity. These are not manuals. */
+export function isVaultDownloadDebris(relativePath: string): boolean {
+  const normalized = relativePath.replace(/\\/g, '/')
+  const name = normalized.slice(normalized.lastIndexOf('/') + 1)
+  return name.endsWith('.aria2') || isVaultSideFile(normalized)
+}
+
+/**
+ * Delete aria2 control files, parity volumes, and piece padding under `root`.
+ * A leftover `.aria2` file makes the next run treat a finished download as incomplete.
+ */
+export async function removeVaultDownloadDebris(root: string): Promise<void> {
+  await deleteDebrisUnder(root, root)
 }
 
 /** 1-based aria2 `--select-file` indexes for the files a reader actually opens. */
@@ -249,6 +265,36 @@ export function locateZippedEntry(
   return { zipRelative, entryName }
 }
 
+export type ZipEntryMatch =
+  | { kind: 'match'; name: string }
+  | { kind: 'missing' }
+  | { kind: 'ambiguous' }
+
+/**
+ * Pick the zip entry for an index path.
+ * A target that already contains a directory must match that full in-zip path.
+ * A bare file name may match exactly one entry with that base name; two hits
+ * (for example `A/intro.pdf` and `B/intro.pdf`) are ambiguous and are not opened.
+ */
+export function matchZipEntry(entryNames: readonly string[], target: string): ZipEntryMatch {
+  const wanted = normalizeZipName(target)
+  if (!wanted || wanted.endsWith('/')) return { kind: 'missing' }
+
+  const names = entryNames
+    .map(normalizeZipName)
+    .filter((name) => name.length > 0 && !name.endsWith('/'))
+
+  const exact = names.filter((name) => name === wanted)
+  if (exact.length === 1) return { kind: 'match', name: exact[0] }
+  if (exact.length > 1) return { kind: 'ambiguous' }
+  if (wanted.includes('/')) return { kind: 'missing' }
+
+  const sameBaseName = names.filter((name) => zipBaseName(name) === wanted)
+  if (sameBaseName.length === 1) return { kind: 'match', name: sameBaseName[0] }
+  if (sameBaseName.length > 1) return { kind: 'ambiguous' }
+  return { kind: 'missing' }
+}
+
 export function isInside(root: string, target: string): boolean {
   const resolvedRoot = resolve(root)
   const resolvedTarget = resolve(target)
@@ -266,6 +312,52 @@ export function contentDisposition(filename: string, inline: boolean): string {
   const base = filename.split(/[/\\]/).pop() || 'manual'
   const cleaned = base.replace(/[\r\n"\\]/g, '_')
   return `${inline ? 'inline' : 'attachment'}; filename="${cleaned}"`
+}
+
+async function deleteDebrisUnder(root: string, current: string): Promise<void> {
+  let entries
+  try {
+    entries = await readdir(current, { withFileTypes: true })
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return
+    throw error
+  }
+
+  for (const entry of entries) {
+    const full = join(current, entry.name)
+    if (!isInside(root, full)) continue
+    const relativePath = relative(root, full)
+    if (entry.isSymbolicLink()) {
+      if (isVaultDownloadDebris(relativePath)) await unlink(full).catch(ignoreMissingFile)
+      continue
+    }
+    if (entry.isDirectory()) {
+      if (isVaultDownloadDebris(relativePath)) {
+        await rm(full, { recursive: true, force: true })
+      } else {
+        await deleteDebrisUnder(root, full)
+      }
+      continue
+    }
+    if (entry.isFile() && isVaultDownloadDebris(relativePath)) {
+      await unlink(full).catch(ignoreMissingFile)
+    }
+  }
+}
+
+function ignoreMissingFile(error: unknown): void {
+  const code = (error as NodeJS.ErrnoException).code
+  if (code !== 'ENOENT') throw error
+}
+
+function normalizeZipName(name: string): string {
+  return name.replace(/\\/g, '/').replace(/^\.\//, '')
+}
+
+function zipBaseName(name: string): string {
+  const slash = name.lastIndexOf('/')
+  return slash === -1 ? name : name.slice(slash + 1)
 }
 
 function uniqueSorted(values: string[]): string[] {

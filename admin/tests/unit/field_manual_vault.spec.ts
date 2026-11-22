@@ -1,5 +1,7 @@
 import * as assert from 'node:assert/strict'
-import { resolve, sep } from 'node:path'
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join, resolve, sep } from 'node:path'
 import { test } from 'node:test'
 
 import { decodeBencode } from '../../app/utils/bencode.js'
@@ -8,8 +10,10 @@ import {
   filterVaultManuals,
   isInside,
   locateZippedEntry,
+  matchZipEntry,
   parseAria2Progress,
   parseVaultIndex,
+  removeVaultDownloadDebris,
   resolveInside,
   safeTorrentDirectoryName,
 } from '../../app/utils/field_manual_vault.js'
@@ -88,6 +92,52 @@ test('locateZippedEntry splits the zip from the entry and rejects traversal', ()
   assert.equal(locateZippedEntry('../etc/passwd'), null)
   assert.equal(locateZippedEntry('PDF/a.zip/../../etc/passwd'), null)
   assert.equal(locateZippedEntry('/etc/passwd'), null)
+})
+
+test('matchZipEntry prefers the full in-zip path and refuses ambiguous file names', () => {
+  assert.deepEqual(matchZipEntry(['nested/A/intro.pdf', 'A/intro.pdf'], 'A/intro.pdf'), {
+    kind: 'match',
+    name: 'A/intro.pdf',
+  })
+  assert.deepEqual(matchZipEntry(['docs/Hello.pdf'], 'Hello.pdf'), {
+    kind: 'match',
+    name: 'docs/Hello.pdf',
+  })
+  assert.deepEqual(matchZipEntry(['Hello.pdf', 'docs/Hello.pdf'], 'Hello.pdf'), {
+    kind: 'match',
+    name: 'Hello.pdf',
+  })
+  assert.deepEqual(matchZipEntry(['A/intro.pdf', 'B/intro.pdf'], 'intro.pdf'), { kind: 'ambiguous' })
+  assert.deepEqual(matchZipEntry(['A/notintro.pdf'], 'intro.pdf'), { kind: 'missing' })
+  assert.deepEqual(matchZipEntry(['nested/A/intro.pdf'], 'A/intro.pdf'), { kind: 'missing' })
+  assert.deepEqual(matchZipEntry(['A\\intro.pdf'], 'A/intro.pdf'), { kind: 'match', name: 'A/intro.pdf' })
+})
+
+test('removeVaultDownloadDebris keeps manuals and drops aria2 leftovers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'nomad-vault-debris-'))
+  try {
+    await mkdir(join(root, 'PDF', 'sub'), { recursive: true })
+    await mkdir(join(root, '.pad'), { recursive: true })
+    await writeFile(join(root, 'index.csv'), 'id\n')
+    await writeFile(join(root, 'PDF', 'Aviation.zip'), 'zip')
+    await writeFile(join(root, 'PDF', 'Aviation.zip.aria2'), 'control')
+    await writeFile(join(root, 'PDF', 'Aviation.zip.par2'), 'parity')
+    await writeFile(join(root, 'PDF', 'sub', 'manual.zip'), 'zip')
+    await writeFile(join(root, 'PDF', 'sub', 'manual.zip.aria2'), 'control')
+    await writeFile(join(root, '.pad', '386988'), 'pad')
+
+    await removeVaultDownloadDebris(root)
+
+    assert.equal(await readFile(join(root, 'index.csv'), 'utf8'), 'id\n')
+    assert.equal(await readFile(join(root, 'PDF', 'Aviation.zip'), 'utf8'), 'zip')
+    assert.equal(await readFile(join(root, 'PDF', 'sub', 'manual.zip'), 'utf8'), 'zip')
+    await assert.rejects(() => stat(join(root, 'PDF', 'Aviation.zip.aria2')))
+    await assert.rejects(() => stat(join(root, 'PDF', 'Aviation.zip.par2')))
+    await assert.rejects(() => stat(join(root, 'PDF', 'sub', 'manual.zip.aria2')))
+    await assert.rejects(() => stat(join(root, '.pad')))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('resolveInside stays under the vault root', () => {

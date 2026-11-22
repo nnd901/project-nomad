@@ -20,6 +20,7 @@ import {
   isInside,
   listTorrentFiles,
   parseAria2Progress,
+  removeVaultDownloadDebris,
   safeTorrentDirectoryName,
 } from '../utils/field_manual_vault.js'
 import {
@@ -268,6 +269,7 @@ async function finalizeFullVault(staging: string, directoryName: string): Promis
     throw new Error('Vault folder escaped field manual storage')
   }
   await stat(join(root, 'index.csv'))
+  await removeVaultDownloadDebris(root)
   await writeFile(
     fieldManualCompleteMarkerPath(),
     JSON.stringify({
