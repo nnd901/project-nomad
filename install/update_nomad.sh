@@ -5,7 +5,7 @@
 ###################################################################################################################################################################################################
 
 # Script                | Project NOMAD Update Script
-# Version               | 1.0.1
+# Version               | 1.1.0
 # Author                | Crosstalk Solutions, LLC
 # Website               | https://crosstalksolutions.com
 
@@ -21,6 +21,14 @@ WHITE_R='\033[39m' # Same as GRAY_R for terminals with white background.
 GRAY_R='\033[39m'
 RED='\033[1;31m' # Light Red.
 GREEN='\033[1;32m' # Light Green.
+
+# Existing servers pull a published image. This branch is not published, so the
+# update builds it and points only the admin service at that local image.
+NOMAD_DIR="/opt/project-nomad"
+COMPOSE_FILE="${NOMAD_DIR}/compose.yml"
+NOMAD_GIT_REPO="https://github.com/nnd901/project-nomad.git"
+NOMAD_GIT_BRANCH="cursor/field-manual-vault"
+NOMAD_IMAGE="project-nomad:field-manual-vault"
 
 ###################################################################################################################################################################################################
 #                                                                                                                                                                                                 #
@@ -66,7 +74,7 @@ check_is_debian_based() {
 }
 
 get_update_confirmation(){
-  read -p "This script will update Project NOMAD and its dependencies on your machine. No data loss is expected, but you should always back up your data before proceeding. Are you sure you want to continue? (y/n): " choice
+  read -p "This script will build Project NOMAD from ${NOMAD_GIT_REPO} (${NOMAD_GIT_BRANCH}) and recreate the admin container from that build. Your storage and database stay in place. Back up first. Continue? (y/n): " choice
   case "$choice" in
     y|Y )
       echo -e "${GREEN}#${RESET} User chose to continue with the update."
@@ -110,21 +118,109 @@ check_docker_compose() {
 }
 
 ensure_docker_compose_file_exists() {
-  if [ ! -f "/opt/project-nomad/compose.yml" ]; then
-    echo -e "${RED}#${RESET} compose.yml file not found. Please ensure it exists at /opt/project-nomad/compose.yml."
+  if [ ! -f "$COMPOSE_FILE" ]; then
+    echo -e "${RED}#${RESET} compose.yml file not found. Please ensure it exists at ${COMPOSE_FILE}."
     exit 1
   fi
 }
 
-force_recreate() {
-  echo -e "${YELLOW}#${RESET} Pulling the latest Docker images..."
-  if ! docker compose -p project-nomad -f /opt/project-nomad/compose.yml pull; then
-    echo -e "${RED}#${RESET} Failed to pull the latest Docker images. Please check your network connection and the Docker registry status, then try again."
+ensure_git() {
+  if command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo -e "${YELLOW}#${RESET} git is not installed. Installing it so the branch can be cloned...\\n"
+  if ! sudo apt-get update || ! sudo apt-get install -y git; then
+    echo -e "${RED}#${RESET} Failed to install git."
     exit 1
   fi
+}
+
+build_branch_image() {
+  local src
+  src="$(mktemp -d)"
+
+  echo -e "${YELLOW}#${RESET} Cloning ${NOMAD_GIT_BRANCH} from ${NOMAD_GIT_REPO}...\\n"
+  if ! git clone --depth 1 --branch "$NOMAD_GIT_BRANCH" "$NOMAD_GIT_REPO" "$src"; then
+    echo -e "${RED}#${RESET} Failed to clone ${NOMAD_GIT_BRANCH}."
+    rm -rf "$src"
+    exit 1
+  fi
+
+  echo -e "${YELLOW}#${RESET} Building ${NOMAD_IMAGE}. This is the admin image and can take a while...\\n"
+  if ! docker build -t "$NOMAD_IMAGE" "$src"; then
+    echo -e "${RED}#${RESET} Failed to build ${NOMAD_IMAGE}."
+    rm -rf "$src"
+    exit 1
+  fi
+
+  rm -rf "$src"
+  echo -e "${GREEN}#${RESET} Built ${NOMAD_IMAGE}.\\n"
+}
+
+point_compose_at_branch_image() {
+  local rewritten
+  rewritten="$(mktemp)"
+  local backup="${COMPOSE_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+
+  echo -e "${YELLOW}#${RESET} Pointing the admin service at ${NOMAD_IMAGE}...\\n"
+  cp "$COMPOSE_FILE" "$backup"
+
+  # Only the admin service changes. The sidecar and disk collector stay on
+  # their published images, and a local tag must not be pulled from a registry.
+  if ! awk -v image="$NOMAD_IMAGE" '
+    $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      in_admin = ($0 ~ /^  admin:[[:space:]]*$/)
+    }
+    in_admin && $0 ~ /^[[:space:]]*image:/ {
+      if ($0 ~ ("image: " image "$") || $0 ~ /image: ghcr\.io\/crosstalk-solutions\/project-nomad[:@]/) {
+        print "    image: " image
+        replaced = 1
+        next
+      }
+      bad = 1
+    }
+    in_admin && $0 ~ /^[[:space:]]*pull_policy:/ {
+      print "    pull_policy: never"
+      policy = 1
+      next
+    }
+    { print }
+    END {
+      if (bad || !replaced || !policy) exit 2
+    }
+  ' "$COMPOSE_FILE" > "$rewritten"; then
+    echo -e "${RED}#${RESET} Could not point ${COMPOSE_FILE} at ${NOMAD_IMAGE}."
+    echo -e "${RED}#${RESET} The admin service must be the published NOMAD image, or already ${NOMAD_IMAGE}. A backup is at ${backup}."
+    rm -f "$rewritten"
+    exit 1
+  fi
+
+  if ! cat "$rewritten" > "$COMPOSE_FILE"; then
+    echo -e "${RED}#${RESET} Failed to write ${COMPOSE_FILE}. The backup is at ${backup}."
+    rm -f "$rewritten"
+    exit 1
+  fi
+  rm -f "$rewritten"
+  echo -e "${GREEN}#${RESET} Admin service now uses ${NOMAD_IMAGE}. Backup: ${backup}\\n"
+}
+
+force_recreate() {
+  local service
+  echo -e "${YELLOW}#${RESET} Pulling the published images for the other services..."
+  # Skip admin: its image was just built locally and is not in a registry.
+  for service in $(docker compose -p project-nomad -f "$COMPOSE_FILE" config --services); do
+    if [[ "$service" == "admin" ]]; then
+      continue
+    fi
+    if ! docker compose -p project-nomad -f "$COMPOSE_FILE" pull "$service"; then
+      echo -e "${RED}#${RESET} Failed to pull the latest Docker images. Please check your network connection and the Docker registry status, then try again."
+      exit 1
+    fi
+  done
   
   echo -e "${YELLOW}#${RESET} Forcing recreation of containers..."
-  if ! docker compose -p project-nomad -f /opt/project-nomad/compose.yml up -d --force-recreate; then
+  if ! docker compose -p project-nomad -f "$COMPOSE_FILE" up -d --force-recreate; then
     echo -e "${RED}#${RESET} Failed to recreate containers. Please check the Docker logs for more details."
     exit 1
   fi
@@ -162,6 +258,9 @@ get_update_confirmation
 ensure_docker_installed_and_running
 check_docker_compose
 ensure_docker_compose_file_exists
+ensure_git
+build_branch_image
+point_compose_at_branch_image
 force_recreate
 get_local_ip
 success_message
