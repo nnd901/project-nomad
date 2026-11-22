@@ -17,8 +17,7 @@ import {
 test('decodeBencode reads a dictionary of a string and an integer', () => {
   const decoded = decodeBencode(Buffer.from('d4:name5:hello6:lengthi42ee'))
   assert.equal(typeof decoded, 'object')
-  assert.ok(!Buffer.isBuffer(decoded) && !Array.isArray(decoded))
-  if (Buffer.isBuffer(decoded) || Array.isArray(decoded)) return
+  if (typeof decoded !== 'object' || Buffer.isBuffer(decoded) || Array.isArray(decoded)) return
   assert.equal((decoded.name as Buffer).toString(), 'hello')
   assert.equal(decoded.length, 42)
 })
