@@ -17,6 +17,11 @@ import BenchmarkResult from '#models/benchmark_result'
 import { BenchmarkType, RunBenchmarkResponse, SubmitBenchmarkResponse, UpdateBuilderTagResponse } from '../../types/benchmark'
 import type { CreateMapMarkerPayload, MapMarkerResponse, UpdateMapMarkerPayload } from '../../types/maps'
 import type { ChatSource } from '../../types/chat'
+import type {
+  FieldManualEditionId,
+  FieldManualSearchResult,
+  FieldManualStatus,
+} from '../../types/field_manual_vault'
 import { chatStreamErrorMessage } from './chat_stream.js'
 
 type OllamaChatRequestWithImages = OllamaChatRequest & { images?: File[] }
@@ -1426,6 +1431,57 @@ class API {
       }>('/system/services/custom', payload)
       return response.data
     })()
+  }
+
+  async fieldManualStatus() {
+    const response = await this.client.get<FieldManualStatus>('/field-manuals/status')
+    return response.data
+  }
+
+  async fieldManualSearch(params: {
+    q?: string
+    family?: string
+    branch?: string
+    pubType?: string
+    offset?: number
+    limit?: number
+  }) {
+    const response = await this.client.get<FieldManualSearchResult>('/field-manuals/search', {
+      params: {
+        q: params.q || undefined,
+        family: params.family,
+        branch: params.branch,
+        pub_type: params.pubType,
+        offset: params.offset,
+        limit: params.limit,
+      },
+    })
+    return response.data
+  }
+
+  async fieldManualDownload(edition: FieldManualEditionId) {
+    return this.fieldManualAction('/field-manuals/download', edition)
+  }
+
+  async fieldManualCancel(edition: FieldManualEditionId) {
+    return this.fieldManualAction('/field-manuals/cancel', edition)
+  }
+
+  async fieldManualRemove(edition: FieldManualEditionId) {
+    return this.fieldManualAction('/field-manuals/remove', edition)
+  }
+
+  private async fieldManualAction(url: string, edition: FieldManualEditionId) {
+    try {
+      const response = await this.client.post<{ success: boolean; message: string }>(url, { edition })
+      return response.data
+    } catch (error) {
+      if (error instanceof AxiosError) {
+        const data = error.response?.data as { message?: string } | undefined
+        return { success: false, message: data?.message || 'Request failed' }
+      }
+      return { success: false, message: 'Request failed' }
+    }
   }
 }
 

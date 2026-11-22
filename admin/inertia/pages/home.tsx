@@ -2,6 +2,7 @@ import {
   IconBolt,
   IconBox,
   IconHelp,
+  IconBook,
   IconMapRoute,
   IconPill,
   IconSettings,
@@ -37,6 +38,17 @@ const MAPS_ITEM = {
   icon: <IconMapRoute size={48} />,
   installed: true,
   displayOrder: 4,
+  poweredBy: null,
+}
+
+const FIELD_MANUALS_ITEM = {
+  label: 'Field Manuals',
+  to: '/field-manuals',
+  target: '',
+  description: 'Download and browse the T.REX Arms field manual vault',
+  icon: <IconBook size={48} />,
+  installed: true,
+  displayOrder: 6,
   poweredBy: null,
 }
 
@@ -216,6 +228,8 @@ export default function Home(props: {
   if (props.drugReferenceInstalled) {
     items.push(DRUG_REFERENCE_ITEM)
   }
+
+  items.push(FIELD_MANUALS_ITEM)
 
   // Add system items
   items.push(...SYSTEM_ITEMS)

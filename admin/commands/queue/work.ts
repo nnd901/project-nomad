@@ -13,6 +13,7 @@ import { AutoUpdateJob } from '#jobs/auto_update_job'
 import { AppAutoUpdateJob } from '#jobs/app_auto_update_job'
 import { ContentAutoUpdateJob } from '#jobs/content_auto_update_job'
 import { DownloadDrugDataJob } from '#jobs/download_drug_data_job'
+import { DownloadFieldManualJob } from '#jobs/download_field_manual_job'
 import { IngestDrugDataJob } from '#jobs/ingest_drug_data_job'
 import { stallOptionsForQueue, type StallOptions } from '../../app/utils/queue_stall_options.js'
 
@@ -201,6 +202,7 @@ export default class QueueWork extends BaseCommand {
     handlers.set(ContentAutoUpdateJob.key, new ContentAutoUpdateJob())
     handlers.set(DownloadDrugDataJob.key, new DownloadDrugDataJob())
     handlers.set(IngestDrugDataJob.key, new IngestDrugDataJob())
+    handlers.set(DownloadFieldManualJob.key, new DownloadFieldManualJob())
 
     queues.set(RunDownloadJob.key, RunDownloadJob.queue)
     queues.set(RunExtractPmtilesJob.key, RunExtractPmtilesJob.queue)
@@ -214,6 +216,7 @@ export default class QueueWork extends BaseCommand {
     queues.set(ContentAutoUpdateJob.key, ContentAutoUpdateJob.queue)
     queues.set(DownloadDrugDataJob.key, DownloadDrugDataJob.queue)
     queues.set(IngestDrugDataJob.key, IngestDrugDataJob.queue)
+    queues.set(DownloadFieldManualJob.key, DownloadFieldManualJob.queue)
 
     return [handlers, queues]
   }
@@ -229,6 +232,7 @@ export default class QueueWork extends BaseCommand {
       download: RunDownloadJob.queue,
       drugDownload: DownloadDrugDataJob.queue,
       drugIngest: IngestDrugDataJob.queue,
+      fieldManual: DownloadFieldManualJob.queue,
     })
   }
 
@@ -252,6 +256,8 @@ export default class QueueWork extends BaseCommand {
       // Drug ingest: one heavy stream at a time — unzipping + parsing ~150 MB
       // of JSON into batched DB inserts; serial keeps memory bounded.
       [IngestDrugDataJob.queue]: 1,
+      // ZIM and full-vault torrents can run together; each edition has its own port and directory.
+      [DownloadFieldManualJob.queue]: 2,
       default: 3,
     }
 

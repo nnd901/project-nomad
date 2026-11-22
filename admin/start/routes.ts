@@ -11,6 +11,7 @@ import ChatsController from '#controllers/chats_controller'
 import ConditionsController from '#controllers/conditions_controller'
 import DocsController from '#controllers/docs_controller'
 import DrugReferenceController from '#controllers/drug_reference_controller'
+import FieldManualVaultController from '#controllers/field_manual_vault_controller'
 import DownloadsController from '#controllers/downloads_controller'
 import EasySetupController from '#controllers/easy_setup_controller'
 import HomeController from '#controllers/home_controller'
@@ -91,6 +92,10 @@ import {
 } from '#validators/responses/chat'
 import { updateNomadMdSchema } from '#validators/nomad_md'
 import { searchDrugValidator, interactionsValidator } from '#validators/drug_reference'
+import {
+  fieldManualEditionValidator,
+  fieldManualSearchValidator,
+} from '#validators/field_manual_vault'
 import { conditionDrugsValidator } from '#validators/conditions'
 
 transmit.registerRoutes()
@@ -908,3 +913,37 @@ router
     })
   })
   .prefix('/api/conditions')
+
+// T.REX Arms Field Manual Vault. Page GETs are ungated, same as Drug Reference.
+// The download writes through a background torrent job; opening a manual only
+// reads a file that is already inside the vault storage root.
+router.get('/field-manuals', [FieldManualVaultController, 'index'])
+router.get('/field-manuals/open/:id', [FieldManualVaultController, 'open'])
+router
+  .group(() => {
+    documented(router.get('/status', [FieldManualVaultController, 'status']), {
+      summary: 'Get Field Manual Vault download status',
+      tags: ['field-manuals'],
+    })
+    documented(router.get('/search', [FieldManualVaultController, 'search']), {
+      summary: 'Search the downloaded Field Manual Vault catalog',
+      tags: ['field-manuals'],
+      query: fieldManualSearchValidator,
+    })
+    documented(router.post('/download', [FieldManualVaultController, 'download']), {
+      summary: 'Download the Field Manual Vault ZIM or the full archive',
+      tags: ['field-manuals'],
+      request: fieldManualEditionValidator,
+    })
+    documented(router.post('/cancel', [FieldManualVaultController, 'cancel']), {
+      summary: 'Cancel a Field Manual Vault download',
+      tags: ['field-manuals'],
+      request: fieldManualEditionValidator,
+    })
+    documented(router.post('/remove', [FieldManualVaultController, 'remove']), {
+      summary: 'Remove a downloaded Field Manual Vault edition',
+      tags: ['field-manuals'],
+      request: fieldManualEditionValidator,
+    })
+  })
+  .prefix('/api/field-manuals')

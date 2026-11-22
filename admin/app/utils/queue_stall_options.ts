@@ -38,6 +38,12 @@ export interface StallQueueNames {
   download: string
   drugDownload: string
   drugIngest: string
+  /**
+   * Field-manual torrents. A second aria2c on the same staging directory can
+   * corrupt the partial download, so a stall fails the job. The user resumes
+   * from aria2's control file by starting the download again.
+   */
+  fieldManual: string
 }
 
 export function stallOptionsForQueue(queueName: string, queues: StallQueueNames): StallOptions {
@@ -62,6 +68,10 @@ export function stallOptionsForQueue(queueName: string, queues: StallQueueNames)
   // job on a second stall and bypasses its own `attempts: 10` retry policy.
   if (queueName === queues.download) {
     return { lockDuration: LONG_LOCK_DURATION, maxStalledCount: 3 }
+  }
+
+  if (queueName === queues.fieldManual) {
+    return { lockDuration: LONG_LOCK_DURATION, maxStalledCount: 0 }
   }
 
   return { lockDuration: DEFAULT_LOCK_DURATION }

@@ -12,6 +12,7 @@ const QUEUES = {
   download: 'downloads',
   drugDownload: 'drug-download',
   drugIngest: 'drug-ingest',
+  fieldManual: 'field-manuals',
 }
 
 const optionsFor = (queue: string) => stallOptionsForQueue(queue, QUEUES)
@@ -69,6 +70,13 @@ test('the two long-running queues take opposite stall policies', () => {
     download.maxStalledCount,
     'non-idempotent chain and resumable download must not share a recovery policy'
   )
+})
+
+test('field manual torrents fail on the first stall instead of starting a second client', () => {
+  assert.deepEqual(optionsFor(QUEUES.fieldManual), {
+    lockDuration: LONG_LOCK_DURATION,
+    maxStalledCount: 0,
+  })
 })
 
 test('the drug queues are unchanged', () => {
