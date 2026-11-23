@@ -24,8 +24,6 @@ export interface FieldManualEditionSpec {
   sizeBytes: number
   torrentUrl: string
   torrentSha256: string
-  /** Distinct listen port so the ZIM and the full vault can download together. */
-  listenPort: number
 }
 
 export const FIELD_MANUAL_EDITIONS: Record<FieldManualEditionId, FieldManualEditionSpec> = {
@@ -39,7 +37,6 @@ export const FIELD_MANUAL_EDITIONS: Record<FieldManualEditionId, FieldManualEdit
     torrentUrl:
       'https://files.trex-arms.com/vault/2026-11/field-manual-vault_eng_2026-11.zim.torrent',
     torrentSha256: 'ee57efcfdbe2bc9c6527d2ba4a5e8110a23d3cbb71825d096364dcaa7d518397',
-    listenPort: 6891,
   },
   full: {
     id: 'full',
@@ -50,7 +47,6 @@ export const FIELD_MANUAL_EDITIONS: Record<FieldManualEditionId, FieldManualEdit
     sizeBytes: 102_717_482_778,
     torrentUrl: 'https://files.trex-arms.com/vault/2026-11/FieldManualVault_2026-11.torrent',
     torrentSha256: 'e3bd94f1e1d2f0ba40007718fdb52a863379f8333f74a2007c7caaf381204bb9',
-    listenPort: 6892,
   },
 }
 

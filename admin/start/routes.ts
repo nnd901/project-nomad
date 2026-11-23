@@ -12,6 +12,7 @@ import ConditionsController from '#controllers/conditions_controller'
 import DocsController from '#controllers/docs_controller'
 import DrugReferenceController from '#controllers/drug_reference_controller'
 import FieldManualVaultController from '#controllers/field_manual_vault_controller'
+import TorrentDownloadController from '#controllers/torrent_download_controller'
 import DownloadsController from '#controllers/downloads_controller'
 import EasySetupController from '#controllers/easy_setup_controller'
 import HomeController from '#controllers/home_controller'
@@ -96,6 +97,7 @@ import {
   fieldManualEditionValidator,
   fieldManualSearchValidator,
 } from '#validators/field_manual_vault'
+import { torrentIdValidator, torrentSourceValidator } from '#validators/torrent_download'
 import { conditionDrugsValidator } from '#validators/conditions'
 
 transmit.registerRoutes()
@@ -947,3 +949,39 @@ router
     })
   })
   .prefix('/api/field-manuals')
+
+// Any torrent the operator supplies. Separate from the Field Manual Vault, which
+// keeps its own page and its own finish step. Both use the aria2 container.
+router.get('/torrents', [TorrentDownloadController, 'index'])
+router
+  .group(() => {
+    documented(router.get('/status', [TorrentDownloadController, 'status']), {
+      summary: 'List torrents started from the admin console',
+      tags: ['torrents'],
+    })
+    documented(router.post('/add', [TorrentDownloadController, 'add']), {
+      summary: 'Start a torrent from a magnet link or a torrent URL',
+      tags: ['torrents'],
+      request: torrentSourceValidator,
+    })
+    documented(router.post('/upload', [TorrentDownloadController, 'upload']), {
+      summary: 'Start a torrent from an uploaded torrent file',
+      tags: ['torrents'],
+    })
+    documented(router.post('/:id/pause', [TorrentDownloadController, 'pause']), {
+      summary: 'Pause a torrent',
+      tags: ['torrents'],
+      params: torrentIdValidator,
+    })
+    documented(router.post('/:id/resume', [TorrentDownloadController, 'resume']), {
+      summary: 'Resume a torrent',
+      tags: ['torrents'],
+      params: torrentIdValidator,
+    })
+    documented(router.post('/:id/remove', [TorrentDownloadController, 'remove']), {
+      summary: 'Remove a torrent and its files',
+      tags: ['torrents'],
+      params: torrentIdValidator,
+    })
+  })
+  .prefix('/api/torrents')

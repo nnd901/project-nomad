@@ -96,8 +96,8 @@ export default function FieldManualsPage(props: { status: FieldManualStatus }) {
 
         {!status.aria2Available && (
           <p className="rounded-lg border border-desert-orange bg-desert-orange/10 px-4 py-3 text-text-primary">
-            Downloads use <code>aria2c</code>, which ships with the NOMAD image. This machine does
-            not have it on PATH.
+            The download service is a separate container, and it is not running. Start NOMAD again
+            so that container comes up.
           </p>
         )}
 
@@ -159,10 +159,18 @@ function EditionCard(props: {
 
       {edition.installed && <p className="mb-3 text-sm font-semibold text-desert-green">On disk</p>}
 
-      {edition.downloading && (
+      {(edition.downloading || edition.paused) && (
         <div className="mb-4" role="status">
           <div className="mb-1 flex justify-between text-sm text-text-secondary">
-            <span>{edition.queued ? 'Waiting to start' : `${edition.progress}%`}</span>
+            <span>
+              {edition.paused
+                ? 'Paused'
+                : edition.queued
+                  ? 'Waiting to start'
+                  : edition.seeders === 0 && edition.downloadSpeed === 0
+                    ? 'Waiting for a seed'
+                    : `${edition.progress}%`}
+            </span>
             {!edition.queued && (
               <span>
                 {formatBytes(edition.downloadedBytes)} / {formatBytes(total)}
@@ -172,6 +180,12 @@ function EditionCard(props: {
           <div className="h-2 overflow-hidden rounded bg-desert-sand">
             <div className="h-2 bg-desert-green" style={{ width: `${edition.progress}%` }} />
           </div>
+          {edition.downloading && !edition.queued && (
+            <p className="mt-1 text-sm text-text-secondary">
+              {formatBytes(edition.downloadSpeed)}/s · {edition.seeders}{' '}
+              {edition.seeders === 1 ? 'seed' : 'seeds'}
+            </p>
+          )}
         </div>
       )}
 
@@ -219,7 +233,7 @@ function EditionCard(props: {
             disabled={!props.aria2Available}
             onClick={props.onDownload}
           >
-            {edition.error ? 'Resume download' : `Download ${edition.title}`}
+            {edition.error || edition.paused ? 'Resume download' : `Download ${edition.title}`}
           </StyledButton>
         )}
       </div>

@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { lstat, mkdir, readFile, readdir, rm, stat, statfs, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -8,6 +7,14 @@ import logger from '@adonisjs/core/services/logger'
 import Service from '#models/service'
 import { KiwixLibraryService } from '#services/kiwix_library_service'
 import { QueueService } from '#services/queue_service'
+import {
+  aria2IsReachable,
+  aria2TellStatus,
+  clearStoredGid,
+  forceRemoveAria2,
+  pauseAria2,
+  readStoredGid,
+} from '#services/aria2_client'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import {
   FIELD_MANUAL_EDITION_IDS,
@@ -19,6 +26,7 @@ import {
   DownloadFieldManualJob,
   FIELD_MANUAL_CANCELLED_MESSAGE,
 } from '../jobs/download_field_manual_job.js'
+import { transferFromStatus, type FieldManualTransfer } from '../utils/aria2_status.js'
 import { formatGiB, hasRoomForDownload } from '../utils/download_integrity.js'
 import {
   contentDisposition,
@@ -35,7 +43,6 @@ import {
 } from '../utils/field_manual_vault.js'
 import {
   fieldManualCompleteMarkerPath,
-  fieldManualPidPath,
   fieldManualStagingDir,
   fieldManualStorageRoot,
   fieldManualTorrentPath,
@@ -114,7 +121,7 @@ export class FieldManualVaultService {
         success: false,
         status: 400,
         message:
-          'aria2c is not installed. The NOMAD image includes it; on a local checkout, install aria2 and retry.',
+          'The download service is not running. It is a separate container; start NOMAD again so that container comes up, then retry.',
       }
     }
 
@@ -159,7 +166,7 @@ export class FieldManualVaultService {
       }
     }
 
-    await killPid(editionId)
+    await pauseStoredDownload(editionId)
     return { success: true, status: 200, message: 'Download cancelled. Start it again to resume.' }
   }
 
@@ -183,9 +190,17 @@ export class FieldManualVaultService {
     if (!isInside(storage, staging)) {
       throw new Error('Refusing to delete a field manual path outside storage')
     }
+    const removed = await forceRemoveStoredDownload(editionId)
+    if (!removed) {
+      return {
+        success: false,
+        status: 409,
+        message:
+          'The download service is not responding, so its files were left in place. Try again once it is running.',
+      }
+    }
     await rm(staging, { recursive: true, force: true })
     await unlink(fieldManualTorrentPath(editionId)).catch(ignoreMissing)
-    await unlink(fieldManualPidPath(editionId)).catch(ignoreMissing)
 
     if (editionId === 'zim') {
       await unlink(fieldManualZimPath()).catch(ignoreMissing)
@@ -308,9 +323,20 @@ export class FieldManualVaultService {
     const queue = QueueService.getInstance().getQueue(DownloadFieldManualJob.queue)
     const job = await queue.getJob(DownloadFieldManualJob.jobIdFor(editionId))
     const state = job ? await job.getState() : null
-    const downloading = state === 'active' || state === 'waiting' || state === 'delayed'
+    const jobBusy = state === 'active' || state === 'waiting' || state === 'delayed'
     const failedReason = state === 'failed' ? job?.failedReason || null : null
-    const progress = readJobProgress(job?.progress, edition.sizeBytes)
+    const live = await liveDownload(editionId)
+    const ariaBusy =
+      live.reachable &&
+      (live.status?.status === 'active' || live.status?.status === 'waiting')
+    const downloading = jobBusy || ariaBusy
+    const installed = await this.isInstalled(editionId)
+    const paused = Boolean(!installed && live.reachable && live.status?.status === 'paused')
+    const progress =
+      live.reachable && live.status
+        ? transferFromStatus(live.status, edition.sizeBytes)
+        : readJobProgress(job?.progress, edition.sizeBytes)
+    const showProgress = downloading || paused
 
     return {
       id: edition.id,
@@ -318,12 +344,16 @@ export class FieldManualVaultService {
       summary: edition.summary,
       sizeLabel: edition.sizeLabel,
       sizeBytes: edition.sizeBytes,
-      installed: await this.isInstalled(editionId),
+      installed,
       downloading,
+      paused,
       queued: state === 'waiting' || state === 'delayed',
-      progress: downloading ? progress.percent : 0,
-      downloadedBytes: downloading ? progress.downloadedBytes : 0,
-      totalBytes: downloading ? progress.totalBytes : edition.sizeBytes,
+      progress: showProgress ? progress.percent : 0,
+      downloadedBytes: showProgress ? progress.downloadedBytes : 0,
+      totalBytes: showProgress ? progress.totalBytes : edition.sizeBytes,
+      downloadSpeed: downloading ? progress.downloadSpeed : 0,
+      seeders: downloading ? progress.seeders : 0,
+      peers: downloading ? progress.peers : 0,
       error: failedReason && !failedReason.includes(FIELD_MANUAL_CANCELLED_MESSAGE) ? failedReason : null,
     }
   }
@@ -385,30 +415,70 @@ async function loadCatalog(): Promise<VaultManualRecord[] | null> {
   return records
 }
 
-function readJobProgress(
-  progress: unknown,
-  fallbackTotal: number
-): { percent: number; downloadedBytes: number; totalBytes: number } {
+function readJobProgress(progress: unknown, fallbackTotal: number): FieldManualTransfer {
   if (progress && typeof progress === 'object' && 'percent' in progress) {
-    const value = progress as { percent?: number; downloadedBytes?: number; totalBytes?: number }
+    const value = progress as Partial<FieldManualTransfer>
     return {
       percent: value.percent ?? 0,
       downloadedBytes: value.downloadedBytes ?? 0,
       totalBytes: value.totalBytes || fallbackTotal,
+      downloadSpeed: value.downloadSpeed ?? 0,
+      seeders: value.seeders ?? 0,
+      peers: value.peers ?? 0,
     }
   }
-  return { percent: 0, downloadedBytes: 0, totalBytes: fallbackTotal }
+  return {
+    percent: 0,
+    downloadedBytes: 0,
+    totalBytes: fallbackTotal,
+    downloadSpeed: 0,
+    seeders: 0,
+    peers: 0,
+  }
 }
 
 async function aria2IsAvailable(): Promise<boolean> {
-  if (aria2Cache && Date.now() - aria2Cache.at < 60_000) return aria2Cache.available
-  const available = await new Promise<boolean>((resolve) => {
-    const child = spawn('aria2c', ['--version'], { stdio: 'ignore' })
-    child.once('error', () => resolve(false))
-    child.once('close', (code) => resolve(code === 0))
-  })
+  if (aria2Cache?.available && Date.now() - aria2Cache.at < 60_000) return true
+  const available = await aria2IsReachable()
   aria2Cache = { at: Date.now(), available }
   return available
+}
+
+type LiveDownload =
+  | { reachable: true; status: Awaited<ReturnType<typeof aria2TellStatus>> }
+  | { reachable: false }
+
+async function liveDownload(editionId: FieldManualEditionId): Promise<LiveDownload> {
+  try {
+    const gid = await readStoredGid(editionId)
+    if (!gid) return { reachable: true, status: null }
+    return { reachable: true, status: await aria2TellStatus(gid) }
+  } catch {
+    return { reachable: false }
+  }
+}
+
+async function pauseStoredDownload(editionId: FieldManualEditionId): Promise<void> {
+  const gid = await readStoredGid(editionId)
+  if (!gid) return
+  try {
+    await pauseAria2(gid)
+  } catch (error) {
+    logger.warn(`[FieldManualVault] could not pause ${editionId}: ${messageOf(error)}`)
+  }
+}
+
+async function forceRemoveStoredDownload(editionId: FieldManualEditionId): Promise<boolean> {
+  const gid = await readStoredGid(editionId)
+  if (!gid) return true
+  try {
+    await forceRemoveAria2(gid)
+    await clearStoredGid(editionId)
+    return true
+  } catch (error) {
+    logger.warn(`[FieldManualVault] could not remove ${editionId} from the download service: ${messageOf(error)}`)
+    return false
+  }
 }
 
 async function freeBytes(dir: string): Promise<number | null> {
@@ -448,51 +518,14 @@ async function bytesUnder(dir: string): Promise<number> {
   return walk(dir)
 }
 
-async function readRecordedPid(editionId: FieldManualEditionId): Promise<number | null> {
-  let text: string
-  try {
-    text = await readFile(fieldManualPidPath(editionId), 'utf8')
-  } catch {
-    return null
-  }
-  const pid = Number(text.trim())
-  if (!Number.isInteger(pid) || pid <= 0) return null
-  return pid
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM'
-  }
-}
-
-async function recordedProcessAlive(editionId: FieldManualEditionId): Promise<boolean> {
-  const pid = await readRecordedPid(editionId)
-  return pid !== null && processIsAlive(pid)
-}
-
-async function killPid(
-  editionId: FieldManualEditionId,
-  signal: NodeJS.Signals = 'SIGTERM'
-): Promise<void> {
-  const pid = await readRecordedPid(editionId)
-  if (pid === null) return
-  try {
-    process.kill(pid, signal)
-  } catch {
-    // The process already exited.
-  }
-}
-
 function jobStateIsBusy(state: string): boolean {
   return state === 'active' || state === 'waiting' || state === 'delayed'
 }
 
 async function editionIsBusy(editionId: FieldManualEditionId): Promise<boolean> {
-  if (await recordedProcessAlive(editionId)) return true
+  const live = await liveDownload(editionId)
+  if (!live.reachable) return true
+  if (live.status?.status === 'active' || live.status?.status === 'waiting') return true
   const queue = QueueService.getInstance().getQueue(DownloadFieldManualJob.queue)
   const job = await queue.getJob(DownloadFieldManualJob.jobIdFor(editionId))
   if (!job) return false
@@ -521,11 +554,16 @@ async function waitUntilIdle(editionId: FieldManualEditionId): Promise<boolean> 
       await discardSettledJob(editionId)
       return true
     }
-    // cancel() already sent SIGTERM. A stuck aria2 must die before this wait
-    // gives up, otherwise remove() would delete files it is still writing.
-    if (!forcedStop && Date.now() >= forceStopAt && (await recordedProcessAlive(editionId))) {
-      forcedStop = true
-      await killPid(editionId, 'SIGKILL')
+    // cancel() already paused the transfer. A download that is still active
+    // has to be dropped before this wait gives up, otherwise remove() would
+    // delete files the download service is still writing.
+    if (!forcedStop && Date.now() >= forceStopAt) {
+      const live = await liveDownload(editionId)
+      const active = live.reachable ? live.status : null
+      if (active && (active.status === 'active' || active.status === 'waiting')) {
+        forcedStop = true
+        await forceRemoveAria2(active.gid).catch(() => undefined)
+      }
     }
     const remaining = deadline - Date.now()
     if (remaining <= 0) break

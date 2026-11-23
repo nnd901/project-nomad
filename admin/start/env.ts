@@ -27,6 +27,8 @@ export default await Env.create(new URL('../', import.meta.url), {
   |----------------------------------------------------------
   */
   NOMAD_STORAGE_PATH: Env.schema.string.optional(),
+  ARIA2_RPC_URL: Env.schema.string.optional(),
+  ARIA2_RPC_SECRET: Env.schema.string.optional(),
 
   /*
   |----------------------------------------------------------

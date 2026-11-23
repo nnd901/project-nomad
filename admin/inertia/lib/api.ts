@@ -22,6 +22,7 @@ import type {
   FieldManualSearchResult,
   FieldManualStatus,
 } from '../../types/field_manual_vault'
+import type { TorrentPageStatus } from '../../types/torrent_download'
 import { chatStreamErrorMessage } from './chat_stream.js'
 
 type OllamaChatRequestWithImages = OllamaChatRequest & { images?: File[] }
@@ -1471,6 +1472,51 @@ class API {
     return this.fieldManualAction('/field-manuals/remove', edition)
   }
 
+  async torrentStatus() {
+    const response = await this.client.get<TorrentPageStatus>('/torrents/status')
+    return response.data
+  }
+
+  async torrentAdd(source: string) {
+    return this.torrentAction('/torrents/add', { source })
+  }
+
+  async torrentUpload(file: File) {
+    const formData = new FormData()
+    formData.append('torrent', file)
+    try {
+      const response = await this.client.post<{ success: boolean; message: string }>(
+        '/torrents/upload',
+        formData,
+        { headers: { 'Content-Type': 'multipart/form-data' } }
+      )
+      return response.data
+    } catch (error) {
+      return torrentError(error)
+    }
+  }
+
+  async torrentPause(id: string) {
+    return this.torrentAction(`/torrents/${id}/pause`)
+  }
+
+  async torrentResume(id: string) {
+    return this.torrentAction(`/torrents/${id}/resume`)
+  }
+
+  async torrentRemove(id: string) {
+    return this.torrentAction(`/torrents/${id}/remove`)
+  }
+
+  private async torrentAction(url: string, body?: { source: string }) {
+    try {
+      const response = await this.client.post<{ success: boolean; message: string }>(url, body ?? {})
+      return response.data
+    } catch (error) {
+      return torrentError(error)
+    }
+  }
+
   private async fieldManualAction(url: string, edition: FieldManualEditionId) {
     try {
       const response = await this.client.post<{ success: boolean; message: string }>(url, { edition })
@@ -1483,6 +1529,14 @@ class API {
       return { success: false, message: 'Request failed' }
     }
   }
+}
+
+function torrentError(error: unknown): { success: false; message: string } {
+  if (error instanceof AxiosError) {
+    const data = error.response?.data as { message?: string } | undefined
+    return { success: false, message: data?.message || 'Request failed' }
+  }
+  return { success: false, message: 'Request failed' }
 }
 
 export default new API()

@@ -21,8 +21,8 @@ export function fieldManualTorrentPath(edition: FieldManualEditionId): string {
   return join(fieldManualStorageRoot(), 'torrents', name)
 }
 
-export function fieldManualPidPath(edition: FieldManualEditionId): string {
-  return join(fieldManualStorageRoot(), `${edition}.pid`)
+export function fieldManualGidPath(edition: FieldManualEditionId): string {
+  return join(fieldManualStorageRoot(), `${edition}.gid`)
 }
 
 export function fieldManualCompleteMarkerPath(): string {

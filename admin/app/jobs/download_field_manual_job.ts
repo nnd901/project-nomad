@@ -1,4 +1,3 @@
-import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyFile, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -7,6 +6,17 @@ import axios from 'axios'
 import logger from '@adonisjs/core/services/logger'
 import { QueueService } from '#services/queue_service'
 import { KiwixLibraryService } from '#services/kiwix_library_service'
+import {
+  addAria2Torrent,
+  aria2TellStatus,
+  findAria2Download,
+  clearStoredGid,
+  pauseAria2,
+  readStoredGid,
+  removeAria2Result,
+  unpauseAria2,
+  writeStoredGid,
+} from '#services/aria2_client'
 import {
   FIELD_MANUAL_EDITIONS,
   FIELD_MANUAL_RELEASE,
@@ -19,13 +29,12 @@ import {
   aria2ContentFileIndexes,
   isInside,
   listTorrentFiles,
-  parseAria2Progress,
   removeVaultDownloadDebris,
   safeTorrentDirectoryName,
 } from '../utils/field_manual_vault.js'
+import { transferFromStatus, type Aria2DownloadStatus } from '../utils/aria2_status.js'
 import {
   fieldManualCompleteMarkerPath,
-  fieldManualPidPath,
   fieldManualStagingDir,
   fieldManualStorageRoot,
   fieldManualTorrentPath,
@@ -103,101 +112,42 @@ export class DownloadFieldManualJob {
       throw new UnrecoverableError('Field manual staging path escaped storage')
     }
     await mkdir(staging, { recursive: true })
+    await unlink(join(fieldManualStorageRoot(), `${edition.id}.pid`)).catch(() => undefined)
 
     const torrentPath = await this.fetchTorrent(edition)
-    const torrent = listTorrentFiles(await readFile(torrentPath))
+    const torrentBytes = await readFile(torrentPath)
+    const torrent = listTorrentFiles(torrentBytes)
     const directoryName = safeTorrentDirectoryName(torrent.name)
     const selectFile = aria2ContentFileIndexes(torrent.files).join(',')
     if (!selectFile) throw new UnrecoverableError('Torrent has no content files to download')
 
-    const child = spawn(
-      'aria2c',
-      [
-        '--dir',
-        staging,
-        '--seed-time=0',
-        '--summary-interval=2',
-        '--console-log-level=notice',
-        '--enable-dht=true',
-        '--bt-enable-lpd=true',
-        '--file-allocation=none',
-        '--auto-file-renaming=false',
-        '--allow-overwrite=true',
-        '--continue=true',
-        '--listen-port',
-        String(edition.listenPort),
-        '--dht-listen-port',
-        String(edition.listenPort),
-        '--select-file',
-        selectFile,
-        torrentPath,
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] }
-    )
+    let current = await attachedDownload(edition.id, staging)
+    if (!current) {
+      const gid = await addAria2Torrent(torrentBytes, staging, selectFile)
+      current = await aria2TellStatus(gid)
+    }
+    if (!current) throw new Error('The download service did not accept the torrent')
+    await writeStoredGid(edition.id, current.gid)
 
-    if (child.pid) {
-      await writeFile(fieldManualPidPath(edition.id), String(child.pid))
+    if (current.status === 'paused') {
+      await unpauseAria2(current.gid)
+      current = (await aria2TellStatus(current.gid)) ?? current
     }
 
-    let cancelled = false
-    let lineBuffer = ''
-    const onChunk = (chunk: Buffer | string) => {
-      lineBuffer += chunk.toString()
-      const lines = lineBuffer.split(/\r?\n/)
-      lineBuffer = lines.pop() ?? ''
-      for (const line of lines) {
-        const progress = parseAria2Progress(line)
-        if (!progress) continue
-        void job.updateProgress({
-          percent: progress.percent,
-          downloadedBytes: progress.downloadedBytes,
-          totalBytes: progress.totalBytes,
-          lastProgressTime: Date.now(),
-        }).catch(() => {
-          // The job may already have been removed by a cancel.
-        })
-      }
+    current = await followDownload(job, redis, edition.id, staging, current, edition.sizeBytes)
+    await removeAria2Result(current.gid)
+
+    if (edition.id === 'zim') {
+      await finalizeZim(staging, directoryName)
+    } else if (edition.id === 'full') {
+      await finalizeFullVault(staging, directoryName)
+    } else {
+      const unreachable: never = edition.id
+      throw new UnrecoverableError(`Unknown edition ${String(unreachable)}`)
     }
-    child.stdout?.on('data', onChunk)
-    child.stderr?.on('data', onChunk)
 
-    const cancelTimer = setInterval(() => {
-      void redis
-        .get(DownloadFieldManualJob.cancelKey(edition.id))
-        .then((flag) => {
-          if (!flag) return
-          cancelled = true
-          child.kill('SIGTERM')
-        })
-        .catch(() => {
-          // The in-process kill from the API covers a Redis blip.
-        })
-    }, 2000)
-
-    try {
-      const code = await waitForClose(child)
-      if (cancelled || (await redis.get(DownloadFieldManualJob.cancelKey(edition.id)))) {
-        await redis.del(DownloadFieldManualJob.cancelKey(edition.id))
-        throw new UnrecoverableError(FIELD_MANUAL_CANCELLED_MESSAGE)
-      }
-      if (code !== 0) {
-        throw new Error(`aria2c exited with code ${code ?? 'signal'}`)
-      }
-
-      if (edition.id === 'zim') {
-        await finalizeZim(staging, directoryName)
-      } else if (edition.id === 'full') {
-        await finalizeFullVault(staging, directoryName)
-      } else {
-        const unreachable: never = edition.id
-        throw new UnrecoverableError(`Unknown edition ${String(unreachable)}`)
-      }
-
-      logger.info(`[FieldManualVault] ${edition.title} download finished`)
-    } finally {
-      clearInterval(cancelTimer)
-      await unlink(fieldManualPidPath(edition.id)).catch(() => undefined)
-    }
+    await clearStoredGid(edition.id)
+    logger.info(`[FieldManualVault] ${edition.title} download finished`)
   }
 
   private async fetchTorrent(edition: FieldManualEditionSpec): Promise<string> {
@@ -220,17 +170,64 @@ export class DownloadFieldManualJob {
   }
 }
 
-function waitForClose(child: ChildProcess): Promise<number | null> {
-  return new Promise((resolve, reject) => {
-    child.once('error', (error: NodeJS.ErrnoException) => {
-      if (error.code === 'ENOENT') {
-        reject(new UnrecoverableError('aria2c is not installed'))
-        return
+async function attachedDownload(
+  editionId: FieldManualEditionId,
+  staging: string
+): Promise<Aria2DownloadStatus | null> {
+  const stored = await readStoredGid(editionId)
+  if (stored) {
+    const status = await aria2TellStatus(stored)
+    if (status) return status
+  }
+  return findAria2Download(staging)
+}
+
+async function followDownload(
+  job: Job,
+  redis: { get(key: string): Promise<string | null>; del(key: string): Promise<unknown> },
+  editionId: FieldManualEditionId,
+  staging: string,
+  initial: Aria2DownloadStatus,
+  fallbackTotal: number
+): Promise<Aria2DownloadStatus> {
+  let current = initial
+  while (true) {
+    if (await redis.get(DownloadFieldManualJob.cancelKey(editionId))) {
+      await pauseAria2(current.gid)
+      await redis.del(DownloadFieldManualJob.cancelKey(editionId))
+      throw new UnrecoverableError(FIELD_MANUAL_CANCELLED_MESSAGE)
+    }
+
+    const reported = await aria2TellStatus(current.gid)
+    const next = reported ?? (await findAria2Download(staging))
+    if (!next) throw new Error('The download disappeared from the download service')
+    if (next.gid !== current.gid) await writeStoredGid(editionId, next.gid)
+    current = next
+    await job
+      .updateProgress({
+        ...transferFromStatus(current, fallbackTotal),
+        lastProgressTime: Date.now(),
+      })
+      .catch(() => undefined)
+
+    switch (current.status) {
+      case 'complete':
+        return current
+      case 'error':
+        throw new Error(current.errorMessage || 'The download failed')
+      case 'paused':
+      case 'removed':
+        throw new UnrecoverableError(FIELD_MANUAL_CANCELLED_MESSAGE)
+      case 'active':
+      case 'waiting':
+        await new Promise((resolve) => setTimeout(resolve, 2000))
+        break
+      default: {
+        const unreachable: never = current.status
+        throw new Error(`Unexpected download status ${String(unreachable)}`)
       }
-      reject(error)
-    })
-    child.once('close', (code) => resolve(code))
-  })
+    }
+  }
 }
 
 async function finalizeZim(staging: string, directoryName: string): Promise<void> {

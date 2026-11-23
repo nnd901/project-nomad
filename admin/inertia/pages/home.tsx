@@ -3,6 +3,7 @@ import {
   IconBox,
   IconHelp,
   IconBook,
+  IconMagnet,
   IconMapRoute,
   IconPill,
   IconSettings,
@@ -19,7 +20,9 @@ import {
   useBenchmarkRerunBanner,
   BENCHMARK_RERUN_BANNER_QUERY_KEY,
 } from '~/hooks/useBenchmarkRerunBanner'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { fieldManualHomeNote } from '../../app/utils/field_manual_tile'
+import { torrentHomeNote } from '../../app/utils/torrent_tile'
 import api from '~/lib/api'
 import Alert from '~/components/Alert'
 import WhatsNewBanner from '~/components/WhatsNewBanner'
@@ -49,6 +52,17 @@ const FIELD_MANUALS_ITEM = {
   icon: <IconBook size={48} />,
   installed: true,
   displayOrder: 6,
+  poweredBy: null,
+}
+
+const TORRENTS_ITEM = {
+  label: 'Torrents',
+  to: '/torrents',
+  target: '',
+  description: 'Download any torrent onto this NOMAD',
+  icon: <IconMagnet size={48} />,
+  installed: true,
+  displayOrder: 7,
   poweredBy: null,
 }
 
@@ -147,6 +161,22 @@ export default function Home(props: {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [linkError, setLinkError] = useState<string | null>(null)
 
+  const fieldManualStatus = useQuery({
+    queryKey: ['field-manuals-status'],
+    queryFn: () => api.fieldManualStatus(),
+    refetchInterval: (query) => {
+      const note = fieldManualHomeNote(query.state.data?.editions ?? [])
+      return note ? 2000 : 15000
+    },
+  })
+  const fieldManualNote = fieldManualHomeNote(fieldManualStatus.data?.editions ?? [])
+  const torrentStatus = useQuery({
+    queryKey: ['torrents-status'],
+    queryFn: () => api.torrentStatus(),
+    refetchInterval: (query) => (torrentHomeNote(query.state.data?.downloads ?? []) ? 2000 : 15000),
+  })
+  const torrentNote = torrentHomeNote(torrentStatus.data?.downloads ?? [])
+
   const refreshServices = () => router.reload({ only: ['system'] })
 
   const handleDeleteTile = async (serviceName: string) => {
@@ -229,7 +259,14 @@ export default function Home(props: {
     items.push(DRUG_REFERENCE_ITEM)
   }
 
-  items.push(FIELD_MANUALS_ITEM)
+  items.push({
+    ...FIELD_MANUALS_ITEM,
+    description: fieldManualNote ?? FIELD_MANUALS_ITEM.description,
+  })
+  items.push({
+    ...TORRENTS_ITEM,
+    description: torrentNote ?? TORRENTS_ITEM.description,
+  })
 
   // Add system items
   items.push(...SYSTEM_ITEMS)

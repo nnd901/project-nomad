@@ -5,7 +5,7 @@
 ###################################################################################################################################################################################################
 
 # Script                | Project NOMAD Update Script
-# Version               | 1.1.0
+# Version               | 1.2.0
 # Author                | Crosstalk Solutions, LLC
 # Website               | https://crosstalksolutions.com
 
@@ -23,12 +23,14 @@ RED='\033[1;31m' # Light Red.
 GREEN='\033[1;32m' # Light Green.
 
 # Existing servers pull a published image. This branch is not published, so the
-# update builds it and points only the admin service at that local image.
+# update builds the admin image and a separate aria2 image, then points compose
+# at those local tags. Storage and the database stay in place.
 NOMAD_DIR="/opt/project-nomad"
 COMPOSE_FILE="${NOMAD_DIR}/compose.yml"
 NOMAD_GIT_REPO="https://github.com/nnd901/project-nomad.git"
 NOMAD_GIT_BRANCH="cursor/field-manual-vault"
 NOMAD_IMAGE="project-nomad:field-manual-vault"
+NOMAD_ARIA2_IMAGE="project-nomad-aria2:field-manual-vault"
 
 ###################################################################################################################################################################################################
 #                                                                                                                                                                                                 #
@@ -74,7 +76,7 @@ check_is_debian_based() {
 }
 
 get_update_confirmation(){
-  read -p "This script will build Project NOMAD from ${NOMAD_GIT_REPO} (${NOMAD_GIT_BRANCH}) and recreate the admin container from that build. Your storage and database stay in place. Back up first. Continue? (y/n): " choice
+  read -p "This script will build Project NOMAD from ${NOMAD_GIT_REPO} (${NOMAD_GIT_BRANCH}), add a download container, and recreate the stack from that build. Your storage and database stay in place. Back up first. Continue? (y/n): " choice
   case "$choice" in
     y|Y )
       echo -e "${GREEN}#${RESET} User chose to continue with the update."
@@ -154,8 +156,15 @@ build_branch_image() {
     exit 1
   fi
 
+  echo -e "${YELLOW}#${RESET} Building ${NOMAD_ARIA2_IMAGE}...\\n"
+  if ! docker build -f "$src/install/aria2/Dockerfile" -t "$NOMAD_ARIA2_IMAGE" "$src"; then
+    echo -e "${RED}#${RESET} Failed to build ${NOMAD_ARIA2_IMAGE}."
+    rm -rf "$src"
+    exit 1
+  fi
+
   rm -rf "$src"
-  echo -e "${GREEN}#${RESET} Built ${NOMAD_IMAGE}.\\n"
+  echo -e "${GREEN}#${RESET} Built ${NOMAD_IMAGE} and ${NOMAD_ARIA2_IMAGE}.\\n"
 }
 
 point_compose_at_branch_image() {
@@ -205,12 +214,102 @@ point_compose_at_branch_image() {
   echo -e "${GREEN}#${RESET} Admin service now uses ${NOMAD_IMAGE}. Backup: ${backup}\\n"
 }
 
+ensure_aria2_service() {
+  local storage_host secret rewritten
+  storage_host="$(awk '
+    $0 ~ /^  admin:[[:space:]]*$/ { in_admin = 1; next }
+    in_admin && $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_admin = 0 }
+    in_admin && $0 ~ /:\/app\/storage$/ {
+      line = $0
+      sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+      sub(/:\/app\/storage$/, "", line)
+      print line
+      exit
+    }
+  ' "$COMPOSE_FILE")"
+  if [[ -z "$storage_host" ]]; then
+    echo -e "${RED}#${RESET} Could not find the admin storage mount in ${COMPOSE_FILE}."
+    exit 1
+  fi
+
+  secret="$(awk '
+    $0 ~ /^[[:space:]]*-[[:space:]]*ARIA2_RPC_SECRET=/ {
+      value = $0
+      sub(/^[[:space:]]*-[[:space:]]*ARIA2_RPC_SECRET=/, "", value)
+      sub(/[[:space:]]*#.*/, "", value)
+      if (value != "" && value != "replaceme") { print value; exit }
+    }
+  ' "$COMPOSE_FILE")"
+  if [[ -z "$secret" ]]; then
+    secret="$(openssl rand -hex 24)"
+  fi
+
+  if grep -q 'ARIA2_RPC_SECRET=replaceme' "$COMPOSE_FILE"; then
+    sed -i "s|ARIA2_RPC_SECRET=replaceme|ARIA2_RPC_SECRET=${secret}|g" "$COMPOSE_FILE"
+  fi
+
+  if ! grep -q 'ARIA2_RPC_URL=' "$COMPOSE_FILE"; then
+    rewritten="$(mktemp)"
+    if ! awk -v secret="$secret" '
+      $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_admin = ($0 ~ /^  admin:[[:space:]]*$/) }
+      in_admin && !inserted && $0 ~ /^[[:space:]]*depends_on:[[:space:]]*$/ {
+        print "      - ARIA2_RPC_URL=http://aria2:6800/jsonrpc"
+        print "      - ARIA2_RPC_SECRET=" secret
+        inserted = 1
+      }
+      { print }
+      END { if (!inserted) exit 2 }
+    ' "$COMPOSE_FILE" > "$rewritten"; then
+      echo -e "${RED}#${RESET} Could not add the download service settings to the admin service."
+      rm -f "$rewritten"
+      exit 1
+    fi
+    cat "$rewritten" > "$COMPOSE_FILE"
+    rm -f "$rewritten"
+  fi
+
+  if grep -q 'container_name: nomad_aria2' "$COMPOSE_FILE"; then
+    echo -e "${GREEN}#${RESET} Download service is already in ${COMPOSE_FILE}.\\n"
+    return 0
+  fi
+
+  rewritten="$(mktemp)"
+  if ! awk -v image="$NOMAD_ARIA2_IMAGE" -v storage="$storage_host" -v secret="$secret" '
+    !inserted && $0 ~ /^volumes:[[:space:]]*$/ {
+      print "  aria2:"
+      print "    image: " image
+      print "    pull_policy: never"
+      print "    container_name: nomad_aria2"
+      print "    logging: *default-logging"
+      print "    restart: unless-stopped"
+      print "    ports:"
+      print "      - \"6881:6881/tcp\""
+      print "      - \"6881:6881/udp\""
+      print "    volumes:"
+      print "      - " storage ":/app/storage"
+      print "    environment:"
+      print "      - ARIA2_RPC_SECRET=" secret
+      print ""
+      inserted = 1
+    }
+    { print }
+    END { if (!inserted) exit 2 }
+  ' "$COMPOSE_FILE" > "$rewritten"; then
+    echo -e "${RED}#${RESET} Could not add the download service to ${COMPOSE_FILE}."
+    rm -f "$rewritten"
+    exit 1
+  fi
+  cat "$rewritten" > "$COMPOSE_FILE"
+  rm -f "$rewritten"
+  echo -e "${GREEN}#${RESET} Added the download service. It listens on port 6881.\\n"
+}
+
 force_recreate() {
   local service
   echo -e "${YELLOW}#${RESET} Pulling the published images for the other services..."
-  # Skip admin: its image was just built locally and is not in a registry.
+  # Skip admin and aria2: those images were just built locally and are not in a registry.
   for service in $(docker compose -p project-nomad -f "$COMPOSE_FILE" config --services); do
-    if [[ "$service" == "admin" ]]; then
+    if [[ "$service" == "admin" || "$service" == "aria2" ]]; then
       continue
     fi
     if ! docker compose -p project-nomad -f "$COMPOSE_FILE" pull "$service"; then
@@ -261,6 +360,7 @@ ensure_docker_compose_file_exists
 ensure_git
 build_branch_image
 point_compose_at_branch_image
+ensure_aria2_service
 force_recreate
 get_local_ip
 success_message

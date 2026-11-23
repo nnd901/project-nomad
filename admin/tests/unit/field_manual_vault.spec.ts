@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { test } from 'node:test'
 
+import { parseAria2Status, transferFromStatus } from '../../app/utils/aria2_status.js'
 import { decodeBencode } from '../../app/utils/bencode.js'
 import {
   aria2ContentFileIndexes,
@@ -56,6 +57,33 @@ test('parseAria2Progress reads a human-readable summary line', () => {
 
 test('parseAria2Progress ignores chatter', () => {
   assert.equal(parseAria2Progress('Downloading 1 item(s)'), null)
+})
+
+test('parseAria2Status reads string lengths from a tellStatus result', () => {
+  const status = parseAria2Status({
+    gid: '2089b0',
+    status: 'active',
+    completedLength: '0',
+    totalLength: '21790280469',
+    downloadSpeed: '0',
+    numSeeders: '0',
+    connections: '1',
+    dir: '/app/storage/field-manuals/zim-staging',
+    errorMessage: '',
+  })
+  assert.ok(status)
+  if (!status) return
+  assert.equal(status.status, 'active')
+  assert.equal(status.totalLength, 21790280469)
+  const transfer = transferFromStatus(status, 1)
+  assert.equal(transfer.percent, 0)
+  assert.equal(transfer.totalBytes, 21790280469)
+  assert.equal(transfer.seeders, 0)
+  assert.equal(transfer.peers, 1)
+})
+
+test('parseAria2Status rejects an unknown status', () => {
+  assert.equal(parseAria2Status({ gid: '2089b0', status: 'seeding' }), null)
 })
 
 test('parseVaultIndex keeps commas that sit inside quotes', () => {
