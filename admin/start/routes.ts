@@ -951,7 +951,7 @@ router
   .prefix('/api/field-manuals')
 
 // Any torrent the operator supplies. Separate from the Field Manual Vault, which
-// keeps its own page and its own finish step. Both use the aria2 container.
+// keeps its own page and its own finish step. Both use the Transmission container.
 router.get('/torrents', [TorrentDownloadController, 'index'])
 router
   .group(() => {

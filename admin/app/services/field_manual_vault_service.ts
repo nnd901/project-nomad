@@ -8,13 +8,13 @@ import Service from '#models/service'
 import { KiwixLibraryService } from '#services/kiwix_library_service'
 import { QueueService } from '#services/queue_service'
 import {
-  aria2IsReachable,
-  aria2TellStatus,
-  clearStoredGid,
-  forceRemoveAria2,
-  pauseAria2,
-  readStoredGid,
-} from '#services/aria2_client'
+  clearStoredHash,
+  pauseTransmission,
+  readStoredHash,
+  removeTransmission,
+  transmissionIsReachable,
+  transmissionTellStatus,
+} from '#services/transmission_client'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import {
   FIELD_MANUAL_EDITION_IDS,
@@ -26,7 +26,7 @@ import {
   DownloadFieldManualJob,
   FIELD_MANUAL_CANCELLED_MESSAGE,
 } from '../jobs/download_field_manual_job.js'
-import { transferFromStatus, type FieldManualTransfer } from '../utils/aria2_status.js'
+import { transferFromStatus, type FieldManualTransfer } from '../utils/transmission_status.js'
 import { formatGiB, hasRoomForDownload } from '../utils/download_integrity.js'
 import {
   contentDisposition,
@@ -439,41 +439,41 @@ function readJobProgress(progress: unknown, fallbackTotal: number): FieldManualT
 
 async function aria2IsAvailable(): Promise<boolean> {
   if (aria2Cache?.available && Date.now() - aria2Cache.at < 60_000) return true
-  const available = await aria2IsReachable()
+  const available = await transmissionIsReachable()
   aria2Cache = { at: Date.now(), available }
   return available
 }
 
 type LiveDownload =
-  | { reachable: true; status: Awaited<ReturnType<typeof aria2TellStatus>> }
+  | { reachable: true; status: Awaited<ReturnType<typeof transmissionTellStatus>> }
   | { reachable: false }
 
 async function liveDownload(editionId: FieldManualEditionId): Promise<LiveDownload> {
   try {
-    const gid = await readStoredGid(editionId)
-    if (!gid) return { reachable: true, status: null }
-    return { reachable: true, status: await aria2TellStatus(gid) }
+    const hash = await readStoredHash(editionId)
+    if (!hash) return { reachable: true, status: null }
+    return { reachable: true, status: await transmissionTellStatus(hash) }
   } catch {
     return { reachable: false }
   }
 }
 
 async function pauseStoredDownload(editionId: FieldManualEditionId): Promise<void> {
-  const gid = await readStoredGid(editionId)
-  if (!gid) return
+  const hash = await readStoredHash(editionId)
+  if (!hash) return
   try {
-    await pauseAria2(gid)
+    await pauseTransmission(hash)
   } catch (error) {
     logger.warn(`[FieldManualVault] could not pause ${editionId}: ${messageOf(error)}`)
   }
 }
 
 async function forceRemoveStoredDownload(editionId: FieldManualEditionId): Promise<boolean> {
-  const gid = await readStoredGid(editionId)
-  if (!gid) return true
+  const hash = await readStoredHash(editionId)
+  if (!hash) return true
   try {
-    await forceRemoveAria2(gid)
-    await clearStoredGid(editionId)
+    await removeTransmission(hash, true)
+    await clearStoredHash(editionId)
     return true
   } catch (error) {
     logger.warn(`[FieldManualVault] could not remove ${editionId} from the download service: ${messageOf(error)}`)
@@ -541,7 +541,7 @@ async function discardSettledJob(editionId: FieldManualEditionId): Promise<void>
 }
 
 /**
- * Wait until aria2 and the queue job have both stopped.
+ * Wait until the download service and the queue job have both stopped.
  * Returns false when they are still running so the caller does not delete
  * files out from under them.
  */
@@ -562,7 +562,7 @@ async function waitUntilIdle(editionId: FieldManualEditionId): Promise<boolean> 
       const active = live.reachable ? live.status : null
       if (active && (active.status === 'active' || active.status === 'waiting')) {
         forcedStop = true
-        await forceRemoveAria2(active.gid).catch(() => undefined)
+        await removeTransmission(active.hash, true).catch(() => undefined)
       }
     }
     const remaining = deadline - Date.now()

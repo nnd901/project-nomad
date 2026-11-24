@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { test } from 'node:test'
 
-import { parseAria2Status, transferFromStatus } from '../../app/utils/aria2_status.js'
+import { parseTransmissionTorrent, transferFromStatus } from '../../app/utils/transmission_status.js'
 import { decodeBencode } from '../../app/utils/bencode.js'
 import {
   aria2ContentFileIndexes,
@@ -59,31 +59,42 @@ test('parseAria2Progress ignores chatter', () => {
   assert.equal(parseAria2Progress('Downloading 1 item(s)'), null)
 })
 
-test('parseAria2Status reads string lengths from a tellStatus result', () => {
-  const status = parseAria2Status({
-    gid: '2089b0',
-    status: 'active',
-    completedLength: '0',
-    totalLength: '21790280469',
-    downloadSpeed: '0',
-    numSeeders: '0',
-    connections: '1',
-    dir: '/app/storage/field-manuals/zim-staging',
-    errorMessage: '',
+test('parseTransmissionTorrent reads a hybrid download and its best seeder count', () => {
+  const status = parseTransmissionTorrent({
+    hashString: '145A0B63F65E7C282C233104BA9E65DD14BAA065',
+    status: 4,
+    sizeWhenDone: 21790280469,
+    leftUntilDone: 21790280469,
+    rateDownload: 0,
+    peersConnected: 2,
+    trackerStats: [{ seederCount: 36 }, { seederCount: 111 }],
+    downloadDir: '/app/storage/field-manuals/zim-staging/',
+    error: 0,
+    errorString: '',
   })
   assert.ok(status)
   if (!status) return
+  assert.equal(status.hash, '145a0b63f65e7c282c233104ba9e65dd14baa065')
   assert.equal(status.status, 'active')
   assert.equal(status.totalLength, 21790280469)
+  assert.equal(status.dir, '/app/storage/field-manuals/zim-staging')
   const transfer = transferFromStatus(status, 1)
   assert.equal(transfer.percent, 0)
   assert.equal(transfer.totalBytes, 21790280469)
-  assert.equal(transfer.seeders, 0)
-  assert.equal(transfer.peers, 1)
+  assert.equal(transfer.seeders, 111)
+  assert.equal(transfer.peers, 2)
 })
 
-test('parseAria2Status rejects an unknown status', () => {
-  assert.equal(parseAria2Status({ gid: '2089b0', status: 'seeding' }), null)
+test('parseTransmissionTorrent treats a stopped finished torrent as complete', () => {
+  const status = parseTransmissionTorrent({
+    hashString: '89249ed754c03e24ed35eedf82c1204a4b90a7c5',
+    status: 0,
+    sizeWhenDone: 102717482778,
+    leftUntilDone: 0,
+    error: 0,
+  })
+  assert.equal(status?.status, 'complete')
+  assert.equal(parseTransmissionTorrent({ hashString: 'abc', status: 7 }), null)
 })
 
 test('parseVaultIndex keeps commas that sit inside quotes', () => {

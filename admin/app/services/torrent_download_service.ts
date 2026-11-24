@@ -4,17 +4,17 @@ import { dirname } from 'node:path'
 import axios from 'axios'
 import logger from '@adonisjs/core/services/logger'
 import {
-  addAria2Torrent,
-  addAria2Uri,
-  aria2IsReachable,
-  aria2TellStatus,
-  findAria2Download,
-  forceRemoveAria2,
-  pauseAria2,
-  unpauseAria2,
-} from '#services/aria2_client'
-import type { Aria2DownloadStatus } from '../utils/aria2_status.js'
-import { transferFromStatus } from '../utils/aria2_status.js'
+  addTransmissionMagnet,
+  addTransmissionTorrent,
+  findTransmissionDownload,
+  pauseTransmission,
+  removeTransmission,
+  startTransmission,
+  transmissionIsReachable,
+  transmissionTellStatus,
+} from '#services/transmission_client'
+import type { TransmissionTorrent } from '../utils/transmission_status.js'
+import { transferFromStatus } from '../utils/transmission_status.js'
 import { parseTorrentCatalog, serializeTorrentCatalog } from '../utils/torrent_catalog.js'
 import { formatGiB, hasRoomForDownload } from '../utils/download_integrity.js'
 import { isInside, listTorrentFiles } from '../utils/field_manual_vault.js'
@@ -47,9 +47,9 @@ export class TorrentDownloadService {
     return exclusive(async () => {
       const loaded = await readCatalog()
       if (!loaded.ok) {
-        return { available: await aria2IsReachable(), catalogError: loaded.message, downloads: [] }
+        return { available: await transmissionIsReachable(), catalogError: loaded.message, downloads: [] }
       }
-      const available = await aria2IsReachable()
+      const available = await transmissionIsReachable()
       if (!available) {
         return {
           available,
@@ -61,8 +61,8 @@ export class TorrentDownloadService {
       const downloads: TorrentDownload[] = []
       for (const record of loaded.records) {
         const live = await locate(record)
-        if (live && live.gid !== record.gid) {
-          record.gid = live.gid
+        if (live && live.hash !== record.gid) {
+          record.gid = live.hash
           changed = true
         }
         downloads.push(viewOf(record, live))
@@ -117,12 +117,11 @@ export class TorrentDownloadService {
           return { success: true, status: 200, message: 'Download paused.' }
         case 'active':
         case 'waiting':
-          await pauseAria2(live.status.gid)
+          await pauseTransmission(live.status.hash)
           return { success: true, status: 200, message: 'Download paused. Start it again to resume.' }
         case 'complete':
           return { success: false, status: 409, message: 'That torrent already finished.' }
         case 'error':
-        case 'removed':
           return { success: false, status: 409, message: 'That torrent is not running.' }
         default: {
           const unreachable: never = live.status.status
@@ -148,10 +147,10 @@ export class TorrentDownloadService {
         return { success: false, status: 409, message: 'That torrent already finished.' }
       }
       if (live.status?.status === 'paused') {
-        await unpauseAria2(live.status.gid)
+        await startTransmission(live.status.hash)
         return { success: true, status: 200, message: 'Download resumed.' }
       }
-      if (live.status) await forceRemoveAria2(live.status.gid)
+      if (live.status) await removeTransmission(live.status.hash, true)
       const added = await submit(record)
       if (!added.ok) return { success: false, status: 400, message: added.message }
       record.gid = added.gid
@@ -169,7 +168,7 @@ export class TorrentDownloadService {
       if (!record) return missing()
       const live = await locateOrUnavailable(record)
       if (!live.reachable) return unavailable()
-      if (live.status) await forceRemoveAria2(live.status.gid)
+      if (live.status) await removeTransmission(live.status.hash, true)
       const dir = torrentFilesDir(record.id)
       if (!isInside(torrentStorageRoot(), dir)) {
         throw new Error('Refusing to delete a torrent path outside storage')
@@ -187,7 +186,7 @@ export class TorrentDownloadService {
     torrent: Buffer | null
   }): Promise<TorrentActionResult> {
     return exclusive(async () => {
-      if (!(await aria2IsReachable())) return unavailable()
+      if (!(await transmissionIsReachable())) return unavailable()
       const loaded = await readCatalog()
       if (!loaded.ok) return { success: false, status: 409, message: loaded.message }
       const room = await ensureRoom()
@@ -217,7 +216,7 @@ export class TorrentDownloadService {
       try {
         await writeCatalog([...loaded.records, record])
       } catch (error) {
-        await forceRemoveAria2(added.gid).catch(() => undefined)
+        await removeTransmission(added.gid, true).catch(() => undefined)
         await rm(dir, { recursive: true, force: true }).catch(() => undefined)
         await unlink(torrentMetaPath(id)).catch(() => undefined)
         throw error
@@ -234,30 +233,30 @@ async function submit(
   const dir = torrentFilesDir(record.id)
   try {
     if (record.magnet) {
-      return { ok: true, gid: await addAria2Uri(record.magnet, dir) }
+      return { ok: true, gid: await addTransmissionMagnet(record.magnet, dir) }
     }
     const bytes = torrent ?? (await readFile(torrentMetaPath(record.id)))
-    return { ok: true, gid: await addAria2Torrent(bytes, dir) }
+    return { ok: true, gid: await addTransmissionTorrent(bytes, dir) }
   } catch (error) {
     if (isMissingFile(error)) {
       return { ok: false, message: 'The original torrent is gone, so this download cannot be resumed.' }
     }
-    logger.error(`[Torrents] aria2 add failed: ${error instanceof Error ? error.message : String(error)}`)
+    logger.error(`[Torrents] add failed: ${error instanceof Error ? error.message : String(error)}`)
     return { ok: false, message: 'The download service rejected that torrent.' }
   }
 }
 
-async function locate(record: StoredTorrent): Promise<Aria2DownloadStatus | null> {
-  if (record.gid) {
-    const status = await aria2TellStatus(record.gid)
+async function locate(record: StoredTorrent): Promise<TransmissionTorrent | null> {
+  if (record.gid && /^[a-f0-9]{40}$/i.test(record.gid)) {
+    const status = await transmissionTellStatus(record.gid)
     if (status) return status
   }
-  return findAria2Download(torrentFilesDir(record.id))
+  return findTransmissionDownload(torrentFilesDir(record.id))
 }
 
 async function locateOrUnavailable(
   record: StoredTorrent
-): Promise<{ reachable: true; status: Aria2DownloadStatus | null } | { reachable: false }> {
+): Promise<{ reachable: true; status: TransmissionTorrent | null } | { reachable: false }> {
   try {
     return { reachable: true, status: await locate(record) }
   } catch {
@@ -265,7 +264,7 @@ async function locateOrUnavailable(
   }
 }
 
-function viewOf(record: StoredTorrent, live: Aria2DownloadStatus | null): TorrentDownload {
+function viewOf(record: StoredTorrent, live: TransmissionTorrent | null): TorrentDownload {
   const state = downloadState(live)
   const transfer = live
     ? transferFromStatus(live, live.totalLength)
@@ -292,7 +291,7 @@ function viewOf(record: StoredTorrent, live: Aria2DownloadStatus | null): Torren
   }
 }
 
-function downloadState(live: Aria2DownloadStatus | null): TorrentDownloadState {
+function downloadState(live: TransmissionTorrent | null): TorrentDownloadState {
   if (!live) return 'stopped'
   switch (live.status) {
     case 'active':
@@ -301,8 +300,6 @@ function downloadState(live: Aria2DownloadStatus | null): TorrentDownloadState {
     case 'error':
     case 'complete':
       return live.status
-    case 'removed':
-      return 'stopped'
     default: {
       const unreachable: never = live.status
       throw new Error(`Unexpected download status ${String(unreachable)}`)

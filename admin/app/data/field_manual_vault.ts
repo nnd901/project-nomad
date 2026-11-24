@@ -4,7 +4,7 @@ import type { FieldManualEditionId } from '../../types/field_manual_vault.js'
  * T.REX Arms Field Manual Vault, release 2026-11.
  *
  * Both editions are published as BitTorrent only. The byte counts are the
- * payload aria2 actually fetches: the ZIM file, and the full vault with
+ * payload the download fetches: the ZIM file, and the full vault with
  * piece-padding and .par2 parity files left out.
  *
  * https://www.trex-arms.com/field-manual-vault/download

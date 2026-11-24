@@ -445,7 +445,7 @@ download_management_compose_file() {
   local app_key=$(generateRandomPass)
   local db_root_password=$(generateRandomPass)
   local db_user_password=$(generateRandomPass)
-  local aria2_secret=$(generateRandomPass)
+  local transmission_secret=$(generateRandomPass)
 
   # If MySQL data directory exists from a previous install attempt, remove it.
   # MySQL only initializes credentials on first startup when the data dir is empty.
@@ -464,7 +464,7 @@ download_management_compose_file() {
   sed -i "s|DB_PASSWORD=replaceme|DB_PASSWORD=${db_user_password}|g" "$compose_file_path"
   sed -i "s|MYSQL_ROOT_PASSWORD=replaceme|MYSQL_ROOT_PASSWORD=${db_root_password}|g" "$compose_file_path"
   sed -i "s|MYSQL_PASSWORD=replaceme|MYSQL_PASSWORD=${db_user_password}|g" "$compose_file_path"
-  sed -i "s|ARIA2_RPC_SECRET=replaceme|ARIA2_RPC_SECRET=${aria2_secret}|g" "$compose_file_path"
+  sed -i "s|TRANSMISSION_RPC_PASSWORD=replaceme|TRANSMISSION_RPC_PASSWORD=${transmission_secret}|g" "$compose_file_path"
   
   echo -e "${GREEN}#${RESET} Docker compose file configured successfully.\\n"
 }

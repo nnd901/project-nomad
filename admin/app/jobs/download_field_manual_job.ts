@@ -7,16 +7,17 @@ import logger from '@adonisjs/core/services/logger'
 import { QueueService } from '#services/queue_service'
 import { KiwixLibraryService } from '#services/kiwix_library_service'
 import {
-  addAria2Torrent,
-  aria2TellStatus,
-  findAria2Download,
-  clearStoredGid,
-  pauseAria2,
-  readStoredGid,
-  removeAria2Result,
-  unpauseAria2,
-  writeStoredGid,
-} from '#services/aria2_client'
+  addTransmissionTorrent,
+  clearStoredHash,
+  findTransmissionDownload,
+  pauseTransmission,
+  readStoredHash,
+  removeTransmission,
+  skipVaultDebris,
+  startTransmission,
+  transmissionTellStatus,
+  writeStoredHash,
+} from '#services/transmission_client'
 import {
   FIELD_MANUAL_EDITIONS,
   FIELD_MANUAL_RELEASE,
@@ -26,13 +27,12 @@ import {
 import type { FieldManualEditionId } from '../../types/field_manual_vault.js'
 import { ensureDirectoryExists } from '../utils/fs.js'
 import {
-  aria2ContentFileIndexes,
   isInside,
   listTorrentFiles,
   removeVaultDownloadDebris,
   safeTorrentDirectoryName,
 } from '../utils/field_manual_vault.js'
-import { transferFromStatus, type Aria2DownloadStatus } from '../utils/aria2_status.js'
+import { transferFromStatus, type TransmissionTorrent } from '../utils/transmission_status.js'
 import {
   fieldManualCompleteMarkerPath,
   fieldManualStagingDir,
@@ -118,24 +118,24 @@ export class DownloadFieldManualJob {
     const torrentBytes = await readFile(torrentPath)
     const torrent = listTorrentFiles(torrentBytes)
     const directoryName = safeTorrentDirectoryName(torrent.name)
-    const selectFile = aria2ContentFileIndexes(torrent.files).join(',')
-    if (!selectFile) throw new UnrecoverableError('Torrent has no content files to download')
+    if (torrent.files.length === 0) throw new UnrecoverableError('Torrent has no content files to download')
 
     let current = await attachedDownload(edition.id, staging)
     if (!current) {
-      const gid = await addAria2Torrent(torrentBytes, staging, selectFile)
-      current = await aria2TellStatus(gid)
+      const hash = await addTransmissionTorrent(torrentBytes, staging)
+      current = await transmissionTellStatus(hash)
     }
     if (!current) throw new Error('The download service did not accept the torrent')
-    await writeStoredGid(edition.id, current.gid)
+    await writeStoredHash(edition.id, current.hash)
+    await skipVaultDebris(current.hash)
 
     if (current.status === 'paused') {
-      await unpauseAria2(current.gid)
-      current = (await aria2TellStatus(current.gid)) ?? current
+      await startTransmission(current.hash)
+      current = (await transmissionTellStatus(current.hash)) ?? current
     }
 
     current = await followDownload(job, redis, edition.id, staging, current, edition.sizeBytes)
-    await removeAria2Result(current.gid)
+    await removeTransmission(current.hash, false)
 
     if (edition.id === 'zim') {
       await finalizeZim(staging, directoryName)
@@ -146,7 +146,7 @@ export class DownloadFieldManualJob {
       throw new UnrecoverableError(`Unknown edition ${String(unreachable)}`)
     }
 
-    await clearStoredGid(edition.id)
+    await clearStoredHash(edition.id)
     logger.info(`[FieldManualVault] ${edition.title} download finished`)
   }
 
@@ -173,13 +173,13 @@ export class DownloadFieldManualJob {
 async function attachedDownload(
   editionId: FieldManualEditionId,
   staging: string
-): Promise<Aria2DownloadStatus | null> {
-  const stored = await readStoredGid(editionId)
+): Promise<TransmissionTorrent | null> {
+  const stored = await readStoredHash(editionId)
   if (stored) {
-    const status = await aria2TellStatus(stored)
+    const status = await transmissionTellStatus(stored)
     if (status) return status
   }
-  return findAria2Download(staging)
+  return findTransmissionDownload(staging)
 }
 
 async function followDownload(
@@ -187,21 +187,21 @@ async function followDownload(
   redis: { get(key: string): Promise<string | null>; del(key: string): Promise<unknown> },
   editionId: FieldManualEditionId,
   staging: string,
-  initial: Aria2DownloadStatus,
+  initial: TransmissionTorrent,
   fallbackTotal: number
-): Promise<Aria2DownloadStatus> {
+): Promise<TransmissionTorrent> {
   let current = initial
   while (true) {
     if (await redis.get(DownloadFieldManualJob.cancelKey(editionId))) {
-      await pauseAria2(current.gid)
+      await pauseTransmission(current.hash)
       await redis.del(DownloadFieldManualJob.cancelKey(editionId))
       throw new UnrecoverableError(FIELD_MANUAL_CANCELLED_MESSAGE)
     }
 
-    const reported = await aria2TellStatus(current.gid)
-    const next = reported ?? (await findAria2Download(staging))
+    const reported = await transmissionTellStatus(current.hash)
+    const next = reported ?? (await findTransmissionDownload(staging))
     if (!next) throw new Error('The download disappeared from the download service')
-    if (next.gid !== current.gid) await writeStoredGid(editionId, next.gid)
+    if (next.hash !== current.hash) await writeStoredHash(editionId, next.hash)
     current = next
     await job
       .updateProgress({
@@ -216,7 +216,6 @@ async function followDownload(
       case 'error':
         throw new Error(current.errorMessage || 'The download failed')
       case 'paused':
-      case 'removed':
         throw new UnrecoverableError(FIELD_MANUAL_CANCELLED_MESSAGE)
       case 'active':
       case 'waiting':

@@ -39,9 +39,9 @@ export interface StallQueueNames {
   drugDownload: string
   drugIngest: string
   /**
-   * Field-manual torrents. A second aria2c on the same staging directory can
-   * corrupt the partial download, so a stall fails the job. The user resumes
-   * from aria2's control file by starting the download again.
+   * Field-manual torrents. A second copy of the same torrent on the staging
+   * directory can corrupt the partial download, so a stall fails the job. The
+   * user resumes the partial by starting the download again.
    */
   fieldManual: string
 }

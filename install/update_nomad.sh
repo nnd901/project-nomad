@@ -5,7 +5,7 @@
 ###################################################################################################################################################################################################
 
 # Script                | Project NOMAD Update Script
-# Version               | 1.2.0
+# Version               | 1.3.0
 # Author                | Crosstalk Solutions, LLC
 # Website               | https://crosstalksolutions.com
 
@@ -23,14 +23,14 @@ RED='\033[1;31m' # Light Red.
 GREEN='\033[1;32m' # Light Green.
 
 # Existing servers pull a published image. This branch is not published, so the
-# update builds the admin image and a separate aria2 image, then points compose
-# at those local tags. Storage and the database stay in place.
+# update builds the admin image and a separate Transmission image, then points
+# compose at those local tags. Storage and the database stay in place.
 NOMAD_DIR="/opt/project-nomad"
 COMPOSE_FILE="${NOMAD_DIR}/compose.yml"
 NOMAD_GIT_REPO="https://github.com/nnd901/project-nomad.git"
 NOMAD_GIT_BRANCH="cursor/field-manual-vault"
 NOMAD_IMAGE="project-nomad:field-manual-vault"
-NOMAD_ARIA2_IMAGE="project-nomad-aria2:field-manual-vault"
+NOMAD_TRANSMISSION_IMAGE="project-nomad-transmission:field-manual-vault"
 
 ###################################################################################################################################################################################################
 #                                                                                                                                                                                                 #
@@ -156,15 +156,15 @@ build_branch_image() {
     exit 1
   fi
 
-  echo -e "${YELLOW}#${RESET} Building ${NOMAD_ARIA2_IMAGE}...\\n"
-  if ! docker build -f "$src/install/aria2/Dockerfile" -t "$NOMAD_ARIA2_IMAGE" "$src"; then
-    echo -e "${RED}#${RESET} Failed to build ${NOMAD_ARIA2_IMAGE}."
+  echo -e "${YELLOW}#${RESET} Building ${NOMAD_TRANSMISSION_IMAGE}...\\n"
+  if ! docker build -f "$src/install/transmission/Dockerfile" -t "$NOMAD_TRANSMISSION_IMAGE" "$src"; then
+    echo -e "${RED}#${RESET} Failed to build ${NOMAD_TRANSMISSION_IMAGE}."
     rm -rf "$src"
     exit 1
   fi
 
   rm -rf "$src"
-  echo -e "${GREEN}#${RESET} Built ${NOMAD_IMAGE} and ${NOMAD_ARIA2_IMAGE}.\\n"
+  echo -e "${GREEN}#${RESET} Built ${NOMAD_IMAGE} and ${NOMAD_TRANSMISSION_IMAGE}.\\n"
 }
 
 point_compose_at_branch_image() {
@@ -214,7 +214,7 @@ point_compose_at_branch_image() {
   echo -e "${GREEN}#${RESET} Admin service now uses ${NOMAD_IMAGE}. Backup: ${backup}\\n"
 }
 
-ensure_aria2_service() {
+ensure_transmission_service() {
   local storage_host secret rewritten
   storage_host="$(awk '
     $0 ~ /^  admin:[[:space:]]*$/ { in_admin = 1; next }
@@ -233,6 +233,12 @@ ensure_aria2_service() {
   fi
 
   secret="$(awk '
+    $0 ~ /^[[:space:]]*-[[:space:]]*TRANSMISSION_RPC_PASSWORD=/ {
+      value = $0
+      sub(/^[[:space:]]*-[[:space:]]*TRANSMISSION_RPC_PASSWORD=/, "", value)
+      sub(/[[:space:]]*#.*/, "", value)
+      if (value != "" && value != "replaceme") { print value; exit }
+    }
     $0 ~ /^[[:space:]]*-[[:space:]]*ARIA2_RPC_SECRET=/ {
       value = $0
       sub(/^[[:space:]]*-[[:space:]]*ARIA2_RPC_SECRET=/, "", value)
@@ -244,42 +250,14 @@ ensure_aria2_service() {
     secret="$(openssl rand -hex 24)"
   fi
 
-  if grep -q 'ARIA2_RPC_SECRET=replaceme' "$COMPOSE_FILE"; then
-    sed -i "s|ARIA2_RPC_SECRET=replaceme|ARIA2_RPC_SECRET=${secret}|g" "$COMPOSE_FILE"
-  fi
-
-  if ! grep -q 'ARIA2_RPC_URL=' "$COMPOSE_FILE"; then
-    rewritten="$(mktemp)"
-    if ! awk -v secret="$secret" '
-      $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_admin = ($0 ~ /^  admin:[[:space:]]*$/) }
-      in_admin && !inserted && $0 ~ /^[[:space:]]*depends_on:[[:space:]]*$/ {
-        print "      - ARIA2_RPC_URL=http://aria2:6800/jsonrpc"
-        print "      - ARIA2_RPC_SECRET=" secret
-        inserted = 1
-      }
-      { print }
-      END { if (!inserted) exit 2 }
-    ' "$COMPOSE_FILE" > "$rewritten"; then
-      echo -e "${RED}#${RESET} Could not add the download service settings to the admin service."
-      rm -f "$rewritten"
-      exit 1
-    fi
-    cat "$rewritten" > "$COMPOSE_FILE"
-    rm -f "$rewritten"
-  fi
-
-  if grep -q 'container_name: nomad_aria2' "$COMPOSE_FILE"; then
-    echo -e "${GREEN}#${RESET} Download service is already in ${COMPOSE_FILE}.\\n"
-    return 0
-  fi
-
   rewritten="$(mktemp)"
-  if ! awk -v image="$NOMAD_ARIA2_IMAGE" -v storage="$storage_host" -v secret="$secret" '
-    !inserted && $0 ~ /^volumes:[[:space:]]*$/ {
-      print "  aria2:"
+  if ! awk -v image="$NOMAD_TRANSMISSION_IMAGE" -v storage="$storage_host" -v secret="$secret" '
+    BEGIN { env_missing = 1 }
+    function emit_service() {
+      print "  transmission:"
       print "    image: " image
       print "    pull_policy: never"
-      print "    container_name: nomad_aria2"
+      print "    container_name: nomad_transmission"
       print "    logging: *default-logging"
       print "    restart: unless-stopped"
       print "    ports:"
@@ -288,28 +266,48 @@ ensure_aria2_service() {
       print "    volumes:"
       print "      - " storage ":/app/storage"
       print "    environment:"
-      print "      - ARIA2_RPC_SECRET=" secret
+      print "      - TRANSMISSION_RPC_PASSWORD=" secret
       print ""
-      inserted = 1
     }
+    $0 ~ /^  aria2:[[:space:]]*$/ { skipping = 1; next }
+    skipping && ($0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ || $0 ~ /^volumes:[[:space:]]*$/) { skipping = 0 }
+    skipping { next }
+    $0 ~ /^[[:space:]]*-[[:space:]]*ARIA2_RPC_(URL|SECRET)=/ { next }
+    $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { in_admin = ($0 ~ /^  admin:[[:space:]]*$/) }
+    in_admin && !env_done && $0 ~ /^[[:space:]]*depends_on:[[:space:]]*$/ {
+      if (env_missing) {
+        print "      - TRANSMISSION_RPC_URL=http://transmission:9091/transmission/rpc"
+        print "      - TRANSMISSION_RPC_USERNAME=nomad"
+        print "      - TRANSMISSION_RPC_PASSWORD=" secret
+      }
+      env_done = 1
+    }
+    $0 ~ /TRANSMISSION_RPC_URL=/ { env_missing = 0 }
+    !service_present && $0 ~ /^volumes:[[:space:]]*$/ {
+      emit_service()
+      service_present = 1
+    }
+    $0 ~ /container_name: nomad_transmission/ { service_present = 1 }
     { print }
-    END { if (!inserted) exit 2 }
+    END { if (!env_done || !service_present) exit 2 }
   ' "$COMPOSE_FILE" > "$rewritten"; then
-    echo -e "${RED}#${RESET} Could not add the download service to ${COMPOSE_FILE}."
+    echo -e "${RED}#${RESET} Could not switch the download service to Transmission."
     rm -f "$rewritten"
     exit 1
   fi
   cat "$rewritten" > "$COMPOSE_FILE"
   rm -f "$rewritten"
-  echo -e "${GREEN}#${RESET} Added the download service. It listens on port 6881.\\n"
+  sed -i "s|TRANSMISSION_RPC_PASSWORD=replaceme|TRANSMISSION_RPC_PASSWORD=${secret}|g" "$COMPOSE_FILE"
+  docker rm -f nomad_aria2 >/dev/null 2>&1 || true
+  echo -e "${GREEN}#${RESET} Download service is Transmission and listens on port 6881.\\n"
 }
 
 force_recreate() {
   local service
   echo -e "${YELLOW}#${RESET} Pulling the published images for the other services..."
-  # Skip admin and aria2: those images were just built locally and are not in a registry.
+  # Skip admin and transmission: those images were just built locally and are not in a registry.
   for service in $(docker compose -p project-nomad -f "$COMPOSE_FILE" config --services); do
-    if [[ "$service" == "admin" || "$service" == "aria2" ]]; then
+    if [[ "$service" == "admin" || "$service" == "transmission" ]]; then
       continue
     fi
     if ! docker compose -p project-nomad -f "$COMPOSE_FILE" pull "$service"; then
@@ -360,7 +358,7 @@ ensure_docker_compose_file_exists
 ensure_git
 build_branch_image
 point_compose_at_branch_image
-ensure_aria2_service
+ensure_transmission_service
 force_recreate
 get_local_ip
 success_message
